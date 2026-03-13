@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const API_URL = import.meta.env.VITE_API_URL || ''
 
 type Phase = 'idle' | 'power_charge' | 'build' | 'broadcast' | 'confirm' | 'done'
 
@@ -53,7 +53,9 @@ function App() {
       reconnectTimer.current = null
     }
 
-    const wsUrl = API_URL.replace('http', 'ws') + '/ws/cannon'
+    const wsUrl = API_URL
+      ? API_URL.replace('http', 'ws') + '/ws/cannon'
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/cannon`
     const ws = new WebSocket(wsUrl)
 
     ws.onopen = () => {

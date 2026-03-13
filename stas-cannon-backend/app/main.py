@@ -1,6 +1,9 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import asyncio
+import os
 import secrets
 import time
 import json
@@ -52,6 +55,16 @@ def generate_address():
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+# Serve frontend static files
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+if os.path.isdir(STATIC_DIR):
+    @app.get("/")
+    async def serve_index():
+        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
 
 
 @app.websocket("/ws/cannon")
