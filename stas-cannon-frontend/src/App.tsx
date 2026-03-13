@@ -347,8 +347,8 @@ function App() {
                 title="パワーチャージ"
                 subtitle="Power Charge"
                 active={phase === 'power_charge'}
-                complete={phase !== 'power_charge' && phase !== 'idle'}
-                value={progress?.phase === 'power_charge' ? formatNumber(progress.current) : (phase !== 'power_charge' && phase !== 'idle' ? formatNumber(totalTransfers) : '—')}
+                complete={phase !== 'power_charge'}
+                value={progress?.phase === 'power_charge' ? formatNumber(progress.current) : (phase !== 'power_charge' ? formatNumber(totalTransfers) : '—')}
                 unit="UTXOs"
               />
               <PhaseCard
