@@ -72,7 +72,6 @@ function App() {
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data)
-
       switch (msg.type) {
         case 'configured':
           setConfigured(true)

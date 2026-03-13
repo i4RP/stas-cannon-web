@@ -78,7 +78,8 @@ async def websocket_cannon(websocket: WebSocket):
             action = msg.get("action")
 
             if action == "configure":
-                total = msg.get("total_transfers", 1_000_000)
+                raw = msg.get("total_transfers")
+                total = int(raw) if raw and int(raw) > 0 else 1_000_000
                 st = CannonState()
                 st.total_transfers = total
                 st.sender_address = generate_address()
