@@ -38,6 +38,8 @@ function App() {
   })
   const [connected, setConnected] = useState(false)
   const [configured, setConfigured] = useState(false)
+  const [chargeComplete, setChargeComplete] = useState(false)
+  const [launchComplete, setLaunchComplete] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -75,6 +77,8 @@ function App() {
       switch (msg.type) {
         case 'configured':
           setConfigured(true)
+          setChargeComplete(false)
+          setLaunchComplete(false)
           setStats(prev => ({
             ...prev,
             senderAddress: msg.sender_address,
@@ -110,7 +114,13 @@ function App() {
           break
 
         case 'phase_complete':
+          if (msg.phase === 'power_charge') {
+            setChargeComplete(true)
+            setPhase('idle')
+          }
           if (msg.phase === 'launch') {
+            setLaunchComplete(true)
+            setPhase('idle')
             setStats(prev => ({
               ...prev,
               txBuilt: msg.tx_built,
@@ -170,14 +180,24 @@ function App() {
     }))
   }
 
-  const handleStart = () => {
+  const handleCharge = () => {
     setProgress(null)
     setStats({
       txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
       tps: 0, buildDuration: 0, broadcastDuration: 0, totalDuration: 0,
       senderAddress: stats.senderAddress, receiverAddress: stats.receiverAddress,
     })
-    wsRef.current?.send(JSON.stringify({ action: 'start' }))
+    wsRef.current?.send(JSON.stringify({ action: 'charge' }))
+  }
+
+  const handleLaunch = () => {
+    setProgress(null)
+    wsRef.current?.send(JSON.stringify({ action: 'launch' }))
+  }
+
+  const handleConfirm = () => {
+    setProgress(null)
+    wsRef.current?.send(JSON.stringify({ action: 'confirm' }))
   }
 
   const handleStop = () => {
@@ -186,29 +206,6 @@ function App() {
 
   const formatNumber = (n: number) => n.toLocaleString()
   const isRunning = phase !== 'idle' && phase !== 'done'
-
-  const getPhaseLabel = (p: Phase): string => {
-    switch (p) {
-      case 'idle': return '待機中'
-      case 'power_charge': return 'パワーチャージ'
-      case 'build': return 'トランザクション構築'
-      case 'broadcast': return '発射中'
-      case 'confirm': return '確認中'
-      case 'done': return '完了'
-      default: return ''
-    }
-  }
-
-  const getPhaseColor = (p: Phase): string => {
-    switch (p) {
-      case 'power_charge': return 'text-yellow-400'
-      case 'build': return 'text-blue-400'
-      case 'broadcast': return 'text-red-400'
-      case 'confirm': return 'text-green-400'
-      case 'done': return 'text-emerald-400'
-      default: return 'text-gray-400'
-    }
-  }
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -241,7 +238,7 @@ function App() {
               <select
                 value={totalTransfers}
                 onChange={(e) => setTotalTransfers(Number(e.target.value))}
-                disabled={isRunning}
+                disabled={isRunning || chargeComplete}
                 className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50"
               >
                 <option value={1000}>1,000</option>
@@ -252,20 +249,11 @@ function App() {
             </div>
             <button
               onClick={handleConfigure}
-              disabled={isRunning || !connected}
+              disabled={isRunning || !connected || chargeComplete}
               className="px-6 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               初期化
             </button>
-            {!isRunning && configured && (
-              <button
-                onClick={handleStart}
-                disabled={!connected}
-                className="px-8 py-2.5 bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-400 hover:to-red-500 rounded-lg font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
-              >
-                発射
-              </button>
-            )}
             {isRunning && (
               <button
                 onClick={handleStop}
@@ -290,87 +278,152 @@ function App() {
           )}
         </section>
 
-        {/* Phase Display */}
-        {phase !== 'idle' && (
-          <section className="space-y-6">
-            {/* Current Phase Banner */}
-            <div className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <span className="text-sm text-gray-500">現在のフェーズ</span>
-                  <h3 className={`text-2xl font-bold ${getPhaseColor(phase)}`}>
-                    {getPhaseLabel(phase)}
-                  </h3>
-                </div>
-                {progress && (
-                  <div className="text-right">
-                    <div className="text-3xl font-bold tabular-nums">
-                      {progress.percent.toFixed(1)}%
-                    </div>
-                    <div className="text-sm text-gray-500">
-                      {formatNumber(progress.current)} / {formatNumber(progress.total)}
-                    </div>
-                  </div>
-                )}
+        {/* Step 1: Charge */}
+        {configured && (
+          <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className={`w-8 h-8 rounded-full text-sm font-bold flex items-center justify-center ${
+                chargeComplete ? 'bg-green-500 text-white' :
+                phase === 'power_charge' ? 'bg-orange-500 text-white animate-pulse' :
+                'bg-yellow-500 text-white'
+              }`}>
+                {chargeComplete ? '✓' : '1'}
               </div>
+              <h3 className="text-xl font-bold">チャージ</h3>
+              {chargeComplete && (
+                <span className="text-green-400 text-sm">{formatNumber(totalTransfers)} UTXOs 準備完了</span>
+              )}
+            </div>
 
-              {/* Progress Bar */}
-              {progress && (
+            {phase === 'power_charge' && progress && (
+              <>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-400">UTXO分割中...</span>
+                  <span className="font-bold tabular-nums">{progress.percent.toFixed(1)}%</span>
+                </div>
+                <div className="w-full bg-gray-800 rounded-full h-3 overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-300 bg-gradient-to-r from-yellow-500 to-orange-500"
+                    style={{ width: `${Math.min(progress.percent, 100)}%` }}
+                  />
+                </div>
+                <div className="text-sm text-gray-500">
+                  {formatNumber(progress.current)} / {formatNumber(progress.total)} UTXOs
+                </div>
+              </>
+            )}
+
+            {!chargeComplete && phase !== 'power_charge' && (
+              <button
+                onClick={handleCharge}
+                disabled={!connected || isRunning}
+                className="w-full px-8 py-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 rounded-lg font-bold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-yellow-500/20"
+              >
+                ⚡ チャージ開始
+              </button>
+            )}
+          </section>
+        )}
+
+        {/* Step 2: Transfer */}
+        {chargeComplete && (
+          <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className={`w-8 h-8 rounded-full text-sm font-bold flex items-center justify-center ${
+                launchComplete ? 'bg-green-500 text-white' :
+                (phase === 'build' || phase === 'broadcast') ? 'bg-orange-500 text-white animate-pulse' :
+                'bg-red-500 text-white'
+              }`}>
+                {launchComplete ? '✓' : '2'}
+              </div>
+              <h3 className="text-xl font-bold">送金時間（10s）</h3>
+              {launchComplete && (
+                <span className="text-green-400 text-sm">{formatNumber(stats.txBroadcast)} 送信完了</span>
+              )}
+            </div>
+
+            {(phase === 'build' || phase === 'broadcast') && progress && (
+              <>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-400">
+                    {phase === 'build' ? 'トランザクション構築中...' : '送信中...'}
+                  </span>
+                  <span className="font-bold tabular-nums">{progress.percent.toFixed(1)}%</span>
+                </div>
                 <div className="w-full bg-gray-800 rounded-full h-3 overflow-hidden">
                   <div
                     className={`h-full rounded-full transition-all duration-300 ${
-                      phase === 'power_charge' ? 'bg-gradient-to-r from-yellow-500 to-orange-500' :
                       phase === 'build' ? 'bg-gradient-to-r from-blue-500 to-cyan-500' :
-                      phase === 'broadcast' ? 'bg-gradient-to-r from-red-500 to-orange-500' :
-                      phase === 'confirm' ? 'bg-gradient-to-r from-green-500 to-emerald-500' :
-                      'bg-gray-600'
+                      'bg-gradient-to-r from-red-500 to-orange-500'
                     }`}
                     style={{ width: `${Math.min(progress.percent, 100)}%` }}
                   />
                 </div>
-              )}
-
-              {/* TPS Display */}
-              {(phase === 'broadcast' || phase === 'done') && stats.tps > 0 && (
-                <div className="mt-4 flex items-baseline gap-2">
-                  <span className="text-4xl font-bold text-orange-400 tabular-nums">
-                    {formatNumber(Math.round(stats.tps))}
-                  </span>
-                  <span className="text-gray-500">TPS</span>
+                <div className="text-sm text-gray-500">
+                  {formatNumber(progress.current)} / {formatNumber(progress.total)}
                 </div>
-              )}
+                {phase === 'broadcast' && stats.tps > 0 && (
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-4xl font-bold text-orange-400 tabular-nums">
+                      {formatNumber(Math.round(stats.tps))}
+                    </span>
+                    <span className="text-gray-500">TPS</span>
+                  </div>
+                )}
+              </>
+            )}
+
+            {!launchComplete && phase !== 'build' && phase !== 'broadcast' && (
+              <button
+                onClick={handleLaunch}
+                disabled={!connected || isRunning}
+                className="w-full px-8 py-3 bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-400 hover:to-red-500 rounded-lg font-bold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
+              >
+                🚀 送金開始（10秒間）
+              </button>
+            )}
+          </section>
+        )}
+
+        {/* Step 3: Result */}
+        {launchComplete && phase !== 'done' && (
+          <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className={`w-8 h-8 rounded-full text-sm font-bold flex items-center justify-center ${
+                phase === 'confirm' ? 'bg-orange-500 text-white animate-pulse' : 'bg-emerald-500 text-white'
+              }`}>
+                3
+              </div>
+              <h3 className="text-xl font-bold">Result</h3>
             </div>
 
-            {/* Phase Steps */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <PhaseCard
-                number={1}
-                title="パワーチャージ"
-                subtitle="Power Charge"
-                active={phase === 'power_charge'}
-                complete={phase !== 'power_charge'}
-                value={progress?.phase === 'power_charge' ? formatNumber(progress.current) : (phase !== 'power_charge' ? formatNumber(totalTransfers) : '—')}
-                unit="UTXOs"
-              />
-              <PhaseCard
-                number={2}
-                title="発射"
-                subtitle="Launch"
-                active={phase === 'build' || phase === 'broadcast'}
-                complete={phase === 'confirm' || phase === 'done'}
-                value={stats.txBroadcast > 0 ? formatNumber(stats.txBroadcast) : (stats.txBuilt > 0 ? formatNumber(stats.txBuilt) : '—')}
-                unit={phase === 'build' ? 'built' : 'sent'}
-              />
-              <PhaseCard
-                number={3}
-                title="確認"
-                subtitle="Confirm"
-                active={phase === 'confirm'}
-                complete={phase === 'done'}
-                value={stats.txConfirmed > 0 ? formatNumber(stats.txConfirmed) : '—'}
-                unit="confirmed"
-              />
-            </div>
+            {phase === 'confirm' && progress && (
+              <>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-400">確認中...</span>
+                  <span className="font-bold tabular-nums">{progress.percent.toFixed(1)}%</span>
+                </div>
+                <div className="w-full bg-gray-800 rounded-full h-3 overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-300 bg-gradient-to-r from-green-500 to-emerald-500"
+                    style={{ width: `${Math.min(progress.percent, 100)}%` }}
+                  />
+                </div>
+                <div className="text-sm text-gray-500">
+                  {formatNumber(progress.current)} / {formatNumber(progress.total)} confirmed
+                </div>
+              </>
+            )}
+
+            {phase !== 'confirm' && (
+              <button
+                onClick={handleConfirm}
+                disabled={!connected || isRunning}
+                className="w-full px-8 py-3 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 rounded-lg font-bold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-green-500/20"
+              >
+                📊 結果を確認
+              </button>
+            )}
           </section>
         )}
 
@@ -400,7 +453,7 @@ function App() {
             </div>
 
             <button
-              onClick={() => { setPhase('idle'); setProgress(null); setConfigured(false); }}
+              onClick={() => { setPhase('idle'); setProgress(null); setConfigured(false); setChargeComplete(false); setLaunchComplete(false); }}
               className="px-8 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg font-medium transition-colors"
             >
               リセット
@@ -432,37 +485,6 @@ function App() {
           STAS Cannon — High-Throughput BSV STAS Token Transfer System — Go + FastAPI + React
         </div>
       </footer>
-    </div>
-  )
-}
-
-function PhaseCard({ number, title, subtitle, active, complete, value, unit }: {
-  number: number; title: string; subtitle: string;
-  active: boolean; complete: boolean; value: string; unit: string;
-}) {
-  return (
-    <div className={`rounded-xl border p-5 transition-all ${
-      active ? 'bg-gray-800/80 border-orange-500/50 shadow-lg shadow-orange-500/10' :
-      complete ? 'bg-gray-800/40 border-green-500/30' :
-      'bg-gray-900 border-gray-800'
-    }`}>
-      <div className="flex items-center gap-2 mb-2">
-        <div className={`w-6 h-6 rounded-full text-xs font-bold flex items-center justify-center ${
-          active ? 'bg-orange-500 text-white' :
-          complete ? 'bg-green-500 text-white' :
-          'bg-gray-700 text-gray-400'
-        }`}>
-          {complete ? '✓' : number}
-        </div>
-        <span className="text-sm text-gray-400">{subtitle}</span>
-      </div>
-      <h4 className="font-bold text-lg mb-1">{title}</h4>
-      <div className="flex items-baseline gap-1">
-        <span className={`text-2xl font-bold tabular-nums ${active ? 'text-orange-400' : complete ? 'text-green-400' : 'text-gray-600'}`}>
-          {value}
-        </span>
-        <span className="text-xs text-gray-500">{unit}</span>
-      </div>
     </div>
   )
 }

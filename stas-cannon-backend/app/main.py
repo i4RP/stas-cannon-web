@@ -32,8 +32,10 @@ class CannonState:
         self.tx_errors = 0
         self.tps = 0.0
         self.start_time = 0.0
+        self.charge_duration = 0.0
         self.build_duration = 0.0
         self.broadcast_duration = 0.0
+        self.confirm_duration = 0.0
         self.total_duration = 0.0
         self.sender_address = ""
         self.receiver_address = ""
@@ -91,22 +93,33 @@ async def websocket_cannon(websocket: WebSocket):
                     "receiver_address": st.receiver_address,
                 })
 
-            elif action == "start":
+            elif action == "charge":
                 if st.running:
                     await websocket.send_json({"type": "error", "message": "Already running"})
                     continue
                 st.running = True
-                st.start_time = time.time()
-
+                charge_start = time.time()
                 await run_power_charge(websocket, st)
-                if not st.running:
-                    continue
-                await run_launch(websocket, st)
-                if not st.running:
-                    continue
-                await run_confirm(websocket, st)
+                st.charge_duration = time.time() - charge_start
+                st.running = False
 
-                st.total_duration = time.time() - st.start_time
+            elif action == "launch":
+                if st.running:
+                    await websocket.send_json({"type": "error", "message": "Already running"})
+                    continue
+                st.running = True
+                await run_launch(websocket, st)
+                st.running = False
+
+            elif action == "confirm":
+                if st.running:
+                    await websocket.send_json({"type": "error", "message": "Already running"})
+                    continue
+                st.running = True
+                confirm_start = time.time()
+                await run_confirm(websocket, st)
+                st.confirm_duration = time.time() - confirm_start
+                st.total_duration = st.charge_duration + st.build_duration + st.broadcast_duration + st.confirm_duration
                 st.running = False
                 st.phase = "done"
                 await websocket.send_json({
