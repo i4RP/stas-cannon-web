@@ -773,7 +773,8 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                     "addressHash160": output.get("addressHash160", address_hash160),
                     "scriptType": "dstas",
                 })
-        except Exception:
+        except Exception as e:
+            print(f"[CHARGE] UTXO parse error for {candidate.get('tx_hash', '?')}:{candidate.get('tx_pos', '?')}: {e}")
             continue
 
     print(f"[CHARGE] Found {len(p2pkh_utxos)} P2PKH UTXOs, {len(dstas_1sat_utxos)} recyclable DSTAS UTXOs")
@@ -993,8 +994,8 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
     st.tx_errors = 0
     st.tx_ids = []
 
-    # Process transfers in batches
-    batch_size = min(10, total)
+    # Process transfers sequentially: each transfer's fee change funds the next
+    batch_size = 1
     for i in range(0, total, batch_size):
         if not st.running:
             return
