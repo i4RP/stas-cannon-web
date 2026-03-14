@@ -709,7 +709,16 @@ async def run_confirm(ws: WebSocket, st: CannonState):
 
 
 async def run_real_power_charge(ws: WebSocket, st: CannonState):
-    """Real Phase 1: Issue testJPYS token + split UTXOs on-chain."""
+    """Real Phase 1: Prepare STAS tokens for transfer.
+
+    Optimizations:
+    1. Token recycling: Reuse existing DSTAS UTXOs from previous runs
+    2. Direct multi-output issuance: Issue N individual 1-sat tokens (no splits needed)
+    3. Lower fee rate: 0.05 sat/byte instead of 0.1 (BSV accepts this)
+    4. Self-transfer: Send to own wallet so tokens can be reused next time
+    """
+    FEE_RATE = 0.05  # Optimization 3: lower fee rate
+
     st.phase = "power_charge"
     total = st.total_transfers
     mode = st.mode
@@ -736,9 +745,10 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
         await ws.send_json({"type": "error", "message": "UTXOがありません。BSVを送金してください。"})
         return
 
-    # Find usable P2PKH UTXOs for funding (try largest first, skip if TX not found)
+    # Step 2: Parse UTXOs - collect both P2PKH (for fees) and DSTAS (for recycling)
     sorted_utxos = sorted(raw_utxos, key=lambda u: u.get("value", 0), reverse=True)
-    p2pkh_utxos: list[dict] = []  # verified P2PKH UTXOs with locking script info
+    p2pkh_utxos: list[dict] = []
+    dstas_1sat_utxos: list[dict] = []  # Existing 1-sat DSTAS tokens for recycling
 
     for idx, candidate in enumerate(sorted_utxos):
         try:
@@ -746,7 +756,6 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
             tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
             output = tx_info["outputs"][candidate["tx_pos"]]
-            # Only use P2PKH outputs (not STAS outputs from previous runs)
             if output.get("scriptType") == "p2pkh":
                 p2pkh_utxos.append({
                     "raw": candidate,
@@ -755,60 +764,19 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                     "satoshis": candidate["value"],
                     "locking_script": output["lockingScriptHex"],
                 })
+            elif output.get("scriptType") == "dstas" and candidate["value"] == 1:
+                dstas_1sat_utxos.append({
+                    "txId": candidate["tx_hash"],
+                    "vout": candidate["tx_pos"],
+                    "satoshis": 1,
+                    "lockingScriptHex": output["lockingScriptHex"],
+                    "addressHash160": output.get("addressHash160", address_hash160),
+                    "scriptType": "dstas",
+                })
         except Exception:
             continue
 
-    if not p2pkh_utxos:
-        await ws.send_json({"type": "error", "message": "利用可能なP2PKH UTXOが見つかりません。BSVを送金してください。"})
-        return
-
-    total_p2pkh_sats = sum(u["satoshis"] for u in p2pkh_utxos)
-    issue_satoshis = total  # 1 sat per token
-    min_required = issue_satoshis + 2000
-
-    # Check if total balance is sufficient
-    if total_p2pkh_sats < min_required:
-        await ws.send_json({"type": "error", "message": f"資金不足: {total_p2pkh_sats} sats < 必要量 {min_required} sats (トークン{issue_satoshis} + 手数料)"})
-        return
-
-    # If largest single UTXO is not enough, consolidate
-    funding_utxo_raw = p2pkh_utxos[0]["raw"]
-    funding_txid = p2pkh_utxos[0]["txid"]
-    funding_vout = p2pkh_utxos[0]["vout"]
-    funding_satoshis = p2pkh_utxos[0]["satoshis"]
-    funding_locking_script = p2pkh_utxos[0]["locking_script"]
-
-    if funding_satoshis < min_required and len(p2pkh_utxos) > 1:
-        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 2, "status": f"UTXO統合中... ({len(p2pkh_utxos)}個 → 1個, {total_p2pkh_sats} sats)"})
-        try:
-            consolidate_inputs = [
-                build_utxo_info(u["txid"], u["vout"], u["satoshis"], u["locking_script"], address_hash160)
-                for u in p2pkh_utxos
-            ]
-            consolidate_result = await stas_service_call("/consolidate", {
-                "privkeyHex": privkey_hex,
-                "utxos": consolidate_inputs,
-                "feeRate": 0.1,
-            })
-            # Broadcast consolidation TX
-            consolidate_txid = await woc_broadcast_tx(consolidate_result["txHex"], mode)
-            print(f"[CHARGE] Consolidation TX broadcast: {consolidate_txid}")
-            # Use the consolidated output as funding
-            consolidated_output = consolidate_result["outputs"][0]
-            funding_txid = consolidate_result["txId"]
-            funding_vout = 0
-            funding_satoshis = consolidated_output["satoshis"]
-            funding_locking_script = consolidated_output["lockingScriptHex"]
-            await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 3, "status": f"UTXO統合完了: {funding_satoshis} sats"})
-        except Exception as e:
-            print(f"[CHARGE] Consolidation failed: {e}")
-            await ws.send_json({"type": "error", "message": f"UTXO統合失敗: {e}"})
-            return
-
-    await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 4, "status": f"Funding UTXO: {funding_satoshis} sats"})
-
-    # Step 3: Issue testJPYS token
-    await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 5, "status": "testJPYSトークン発行中..."})
+    print(f"[CHARGE] Found {len(p2pkh_utxos)} P2PKH UTXOs, {len(dstas_1sat_utxos)} recyclable DSTAS UTXOs")
 
     token_scheme = {
         "name": "testJPYS",
@@ -821,104 +789,16 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     }
     st.token_scheme = token_scheme
 
-    # Issue all tokens to ourselves in one output
-    # Estimate minimum required: token sats + fees (~2000 sats overhead)
-    if funding_satoshis < min_required:
-        await ws.send_json({"type": "error", "message": f"資金不足: {funding_satoshis} sats < 必要量 {min_required} sats (トークン{issue_satoshis} + 手数料)"})
-        return
-    try:
-        print(f"[CHARGE] Calling /issue with {issue_satoshis} sats, funding={funding_satoshis}")
-        issue_result = await stas_service_call("/issue", {
-            "privkeyHex": privkey_hex,
-            "fundingUtxo": build_utxo_info(funding_txid, funding_vout, funding_satoshis, funding_locking_script, address_hash160),
-            "scheme": token_scheme,
-            "destinations": [{"satoshis": issue_satoshis, "toHash160": address_hash160}],
-            "feeRate": 0.1,
-        })
-        print(f"[CHARGE] Issue result keys: {list(issue_result.keys())}")
-    except Exception as e:
-        print(f"[CHARGE] Issue failed: {e}")
-        await ws.send_json({"type": "error", "message": f"トークン発行失敗: {e}"})
-        return
+    # =========================================================================
+    # Optimization 1: Token recycling - reuse existing DSTAS UTXOs
+    # =========================================================================
+    if len(dstas_1sat_utxos) >= total:
+        print(f"[CHARGE] Recycling {total} existing DSTAS tokens (skipping issuance)")
+        await ws.send_json({"type": "progress", "phase": "power_charge", "current": total, "total": total, "percent": 90, "status": f"既存トークン再利用: {total}個 (発行スキップ)"})
 
-    # Step 4: Broadcast Contract TX
-    await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 10, "status": "Contract TXブロードキャスト中..."})
-    try:
-        contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
-        print(f"[CHARGE] Contract TX broadcast: {contract_txid}")
-    except Exception as e:
-        print(f"[CHARGE] Contract TX broadcast failed: {e}")
-        await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗: {e}"})
-        return
-
-    # Step 5: Broadcast Issue TX
-    await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 15, "status": "Issue TXブロードキャスト中..."})
-    try:
-        issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
-        st.issue_txid = issue_txid
-        print(f"[CHARGE] Issue TX broadcast: {issue_txid}")
-    except Exception as e:
-        print(f"[CHARGE] Issue TX broadcast failed: {e}")
-        await ws.send_json({"type": "error", "message": f"Issue TXブロードキャスト失敗: {e}"})
-        return
-
-    await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 20, "status": f"トークン発行完了: {issue_txid[:16]}..."})
-
-    # Step 6: Split STAS tokens into individual UTXOs
-    # The issue TX has the STAS output at vout=0 with `issue_satoshis` sats
-    # We need to split it into `total` UTXOs of 1 sat each
-    # SDK supports max 4 outputs per split, so we do hierarchical splitting
-
-    issue_outputs = issue_result["issueOutputs"]
-    # Find the DSTAS output
-    stas_output = None
-    for out in issue_outputs:
-        if out["scriptType"] == "dstas":
-            stas_output = out
-            break
-
-    print(f"[CHARGE] Issue outputs: {[(o['scriptType'], o['satoshis']) for o in issue_outputs]}")
-    if not stas_output:
-        await ws.send_json({"type": "error", "message": "Issue TXにDSTAS出力が見つかりません"})
-        return
-    print(f"[CHARGE] STAS output: vout={stas_output['vout']}, sats={stas_output['satoshis']}")
-
-    # Find the change output from issue TX for fees
-    fee_change_output = None
-    for out in issue_outputs:
-        if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
-            fee_change_output = out
-            break
-
-    # Current pool of STAS UTXOs to split further
-    pending_stas = [{
-        "txId": issue_txid,
-        "vout": stas_output["vout"],
-        "satoshis": stas_output["satoshis"],
-        "lockingScriptHex": stas_output["lockingScriptHex"],
-        "addressHash160": stas_output["addressHash160"],
-        "scriptType": "dstas",
-    }]
-    final_stas = []  # UTXOs with exactly 1 sat (ready for transfer)
-
-    # Fee UTXO pool - start with change from issue TX
-    fee_pool = []
-    if fee_change_output:
-        fee_pool.append({
-            "txId": issue_txid,
-            "vout": fee_change_output["vout"],
-            "satoshis": fee_change_output["satoshis"],
-            "lockingScriptHex": fee_change_output["lockingScriptHex"],
-            "addressHash160": fee_change_output["addressHash160"],
-            "scriptType": "p2pkh",
-        })
-
-    # Also add remaining P2PKH UTXOs as fee sources (skip the one used for funding/consolidation)
-    # After consolidation, all p2pkh_utxos were merged so none remain.
-    # Without consolidation, only p2pkh_utxos[0] was used for funding, rest can be fee sources.
-    if funding_satoshis >= min_required:
-        # No consolidation happened - unused P2PKH UTXOs can be fee sources
-        for u in p2pkh_utxos[1:]:
+        final_stas = dstas_1sat_utxos[:total]
+        fee_pool = []
+        for u in p2pkh_utxos:
             fee_pool.append({
                 "txId": u["txid"],
                 "vout": u["vout"],
@@ -928,164 +808,160 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                 "scriptType": "p2pkh",
             })
 
-    print(f"[CHARGE] Fee pool size: {len(fee_pool)}, pending_stas: {len(pending_stas)}")
-    split_round = 0
-    while pending_stas and len(final_stas) < total and st.running:
-        split_round += 1
-        next_pending = []
+        st.issue_txid = "recycled"
 
-        for stas_utxo in pending_stas:
-            if len(final_stas) >= total:
-                break
-            if not st.running:
-                return
+    else:
+        # =====================================================================
+        # Optimization 2: Direct multi-output issuance (no splits needed)
+        # Issue N individual 1-sat DSTAS UTXOs directly
+        # =====================================================================
+        existing_count = len(dstas_1sat_utxos)
+        new_count = total - existing_count
 
-            remaining = stas_utxo["satoshis"]
-            if remaining <= 0:
-                continue
+        if not p2pkh_utxos:
+            await ws.send_json({"type": "error", "message": "利用可能なP2PKH UTXOが見つかりません。BSVを送金してください。"})
+            return
 
-            if remaining == 1:
-                final_stas.append(stas_utxo)
-                continue
+        total_p2pkh_sats = sum(u["satoshis"] for u in p2pkh_utxos)
+        # Estimate fee: each DSTAS output ~2918 bytes, at FEE_RATE
+        estimated_issue_fee = int((new_count * 2918 + 1000) * FEE_RATE) + 500
+        min_required = new_count + estimated_issue_fee
 
-            # Split into up to 4 pieces
-            num_splits = min(4, remaining)
-            needed = total - len(final_stas)
-            num_splits = min(num_splits, needed) if remaining >= needed else min(4, remaining)
+        if total_p2pkh_sats < min_required:
+            max_affordable = int((total_p2pkh_sats - 500) / (1 + 2918 * FEE_RATE))
+            max_affordable = max(0, max_affordable) + existing_count
+            await ws.send_json({"type": "error", "message": f"資金不足: {total_p2pkh_sats} sats < 必要量 ~{min_required} sats。現在の残高で最大 {max_affordable} 件のテストが可能です。"})
+            return
 
-            if num_splits <= 1:
-                final_stas.append(stas_utxo)
-                continue
+        # Consolidate if needed
+        funding_txid = p2pkh_utxos[0]["txid"]
+        funding_vout = p2pkh_utxos[0]["vout"]
+        funding_satoshis = p2pkh_utxos[0]["satoshis"]
+        funding_locking_script = p2pkh_utxos[0]["locking_script"]
 
-            # Calculate split amounts
-            base_amount = remaining // num_splits
-            remainder = remaining % num_splits
-            dests = []
-            for i in range(num_splits):
-                amt = base_amount + (1 if i < remainder else 0)
-                if amt > 0:
-                    dests.append({"satoshis": amt, "toHash160": address_hash160})
-
-            if not dests:
-                continue
-
-            # Get a fee UTXO
-            if not fee_pool:
-                await ws.send_json({"type": "error", "message": "Fee UTXOが不足しています"})
-                return
-
-            # Get a fee UTXO - DSTAS split TXs need ~1600 sats minimum fee
-            # (DSTAS locking scripts are ~2918 bytes, making split TXs ~15KB)
-            MIN_FEE_SATS = 2000  # minimum sats per fee UTXO for DSTAS operations
-            fee_utxo = fee_pool.pop(0)
-            print(f"[CHARGE] Using fee UTXO: txId={fee_utxo['txId'][:16]}... vout={fee_utxo['vout']} sats={fee_utxo['satoshis']}, pool_remaining={len(fee_pool)}")
-
-            # Split fee UTXO if it's large and pool is running low
-            if fee_utxo["satoshis"] > MIN_FEE_SATS * 2 and len(fee_pool) < len(pending_stas) * 2:
-                # Split into pieces of at least MIN_FEE_SATS each
-                num_fee_splits = min(10, fee_utxo["satoshis"] // MIN_FEE_SATS)
-                if num_fee_splits > 1:
-                    fee_split_amt = fee_utxo["satoshis"] // num_fee_splits
-                    fee_outputs = [{"satoshis": fee_split_amt} for _ in range(num_fee_splits - 1)]
-                    try:
-                        fee_split_result = await stas_service_call("/p2pkh-split", {
-                            "privkeyHex": privkey_hex,
-                            "utxo": fee_utxo,
-                            "outputs": fee_outputs,
-                            "feeRate": 0.1,
-                        })
-                        fee_split_txid = await woc_broadcast_tx(fee_split_result["txHex"], mode)
-                        for out in fee_split_result["outputs"]:
-                            if out["scriptType"] == "p2pkh" and out["satoshis"] >= MIN_FEE_SATS:
-                                fee_pool.append({
-                                    "txId": fee_split_txid,
-                                    "vout": out["vout"],
-                                    "satoshis": out["satoshis"],
-                                    "lockingScriptHex": out["lockingScriptHex"],
-                                    "addressHash160": out.get("addressHash160", address_hash160),
-                                    "scriptType": "p2pkh",
-                                })
-                        fee_utxo = fee_pool.pop(0)
-                        print(f"[CHARGE] Fee split done: {len(fee_pool)+1} fee UTXOs of ~{fee_split_amt} sats each")
-                    except Exception as e:
-                        print(f"[CHARGE] Fee split failed: {e}, using original UTXO")
-                        pass  # Use original fee UTXO if split fails
-
-            # Execute STAS split
+        if funding_satoshis < min_required and len(p2pkh_utxos) > 1:
+            await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 2, "status": f"UTXO統合中... ({len(p2pkh_utxos)}個 → 1個, {total_p2pkh_sats} sats)"})
             try:
-                split_payload = {
+                consolidate_inputs = [
+                    build_utxo_info(u["txid"], u["vout"], u["satoshis"], u["locking_script"], address_hash160)
+                    for u in p2pkh_utxos
+                ]
+                consolidate_result = await stas_service_call("/consolidate", {
                     "privkeyHex": privkey_hex,
-                    "stasUtxo": stas_utxo,
-                    "feeUtxo": fee_utxo,
-                    "destinations": dests,
-                    "scheme": token_scheme,
-                    "feeRate": 0.1,
-                }
-                print(f"[CHARGE] Split payload: stasUtxo sats={stas_utxo['satoshis']}, feeUtxo sats={fee_utxo['satoshis']}, dests={len(dests)}, fee txId={fee_utxo['txId'][:16]}")
-                split_result = await stas_service_call("/split", split_payload)
-                split_txid = await woc_broadcast_tx(split_result["txHex"], mode)
-
-                for out in split_result["outputs"]:
-                    if out["scriptType"] == "dstas":
-                        new_utxo = {
-                            "txId": split_txid,
-                            "vout": out["vout"],
-                            "satoshis": out["satoshis"],
-                            "lockingScriptHex": out["lockingScriptHex"],
-                            "addressHash160": out.get("addressHash160", address_hash160),
-                            "scriptType": "dstas",
-                        }
-                        if out["satoshis"] == 1:
-                            final_stas.append(new_utxo)
-                        else:
-                            next_pending.append(new_utxo)
-                    elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
-                        fee_pool.append({
-                            "txId": split_txid,
-                            "vout": out["vout"],
-                            "satoshis": out["satoshis"],
-                            "lockingScriptHex": out["lockingScriptHex"],
-                            "addressHash160": out.get("addressHash160", address_hash160),
-                            "scriptType": "p2pkh",
-                        })
-
+                    "utxos": consolidate_inputs,
+                    "feeRate": FEE_RATE,
+                })
+                consolidate_txid = await woc_broadcast_tx(consolidate_result["txHex"], mode)
+                print(f"[CHARGE] Consolidation TX broadcast: {consolidate_txid}")
+                consolidated_output = consolidate_result["outputs"][0]
+                funding_txid = consolidate_result["txId"]
+                funding_vout = 0
+                funding_satoshis = consolidated_output["satoshis"]
+                funding_locking_script = consolidated_output["lockingScriptHex"]
+                p2pkh_utxos = []  # All merged
             except Exception as e:
-                st.tx_errors += 1
-                print(f"[CHARGE] Split error: {e}, fee_pool_size={len(fee_pool)}")
-                await ws.send_json({"type": "progress", "phase": "power_charge", "current": len(final_stas), "total": total, "percent": round(len(final_stas) / total * 100, 1), "status": f"Split error: {e}"})
-                # Put the STAS UTXO back for retry
-                next_pending.append(stas_utxo)
-                continue
+                print(f"[CHARGE] Consolidation failed: {e}")
+                await ws.send_json({"type": "error", "message": f"UTXO統合失敗: {e}"})
+                return
 
-            progress_pct = min(95, 20 + round(len(final_stas) / total * 75, 1))
-            await ws.send_json({
-                "type": "progress",
-                "phase": "power_charge",
-                "current": len(final_stas),
-                "total": total,
-                "percent": progress_pct,
-                "status": f"Split round {split_round}: {len(final_stas)}/{total} UTXOs ready",
+        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 5, "status": f"testJPYSトークン {new_count}個 直接発行中..."})
+
+        # Direct multi-output issuance: N destinations of 1 sat each
+        destinations = [{"satoshis": 1, "toHash160": address_hash160} for _ in range(new_count)]
+
+        try:
+            print(f"[CHARGE] Direct issuance: {new_count} tokens, funding={funding_satoshis} sats, feeRate={FEE_RATE}")
+            issue_result = await stas_service_call("/issue", {
+                "privkeyHex": privkey_hex,
+                "fundingUtxo": build_utxo_info(funding_txid, funding_vout, funding_satoshis, funding_locking_script, address_hash160),
+                "scheme": token_scheme,
+                "destinations": destinations,
+                "feeRate": FEE_RATE,
             })
+        except Exception as e:
+            print(f"[CHARGE] Issue failed: {e}")
+            await ws.send_json({"type": "error", "message": f"トークン発行失敗: {e}"})
+            return
 
-        pending_stas = next_pending
+        # Broadcast Contract TX
+        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 30, "status": "Contract TXブロードキャスト中..."})
+        try:
+            contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+            print(f"[CHARGE] Contract TX broadcast: {contract_txid}")
+        except Exception as e:
+            await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗: {e}"})
+            return
 
-    # Store results
-    print(f"[CHARGE] Final: {len(final_stas)} STAS UTXOs, {len(fee_pool)} fee UTXOs")
+        # Broadcast Issue TX
+        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 60, "status": f"Issue TX ({new_count}トークン) ブロードキャスト中..."})
+        try:
+            issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
+            st.issue_txid = issue_txid
+            print(f"[CHARGE] Issue TX broadcast: {issue_txid}")
+        except Exception as e:
+            await ws.send_json({"type": "error", "message": f"Issue TXブロードキャスト失敗: {e}"})
+            return
+
+        # Collect DSTAS outputs from issue TX (already individual 1-sat tokens!)
+        issue_outputs = issue_result["issueOutputs"]
+        final_stas = list(dstas_1sat_utxos)  # Start with recycled tokens
+        fee_pool = []
+
+        for out in issue_outputs:
+            if out["scriptType"] == "dstas" and out["satoshis"] == 1:
+                final_stas.append({
+                    "txId": issue_txid,
+                    "vout": out["vout"],
+                    "satoshis": 1,
+                    "lockingScriptHex": out["lockingScriptHex"],
+                    "addressHash160": out.get("addressHash160", address_hash160),
+                    "scriptType": "dstas",
+                })
+            elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                fee_pool.append({
+                    "txId": issue_txid,
+                    "vout": out["vout"],
+                    "satoshis": out["satoshis"],
+                    "lockingScriptHex": out["lockingScriptHex"],
+                    "addressHash160": out.get("addressHash160", address_hash160),
+                    "scriptType": "p2pkh",
+                })
+
+        # Add unused P2PKH UTXOs to fee pool (if no consolidation happened)
+        if funding_satoshis >= min_required:
+            for u in p2pkh_utxos[1:]:
+                fee_pool.append({
+                    "txId": u["txid"],
+                    "vout": u["vout"],
+                    "satoshis": u["satoshis"],
+                    "lockingScriptHex": u["locking_script"],
+                    "addressHash160": address_hash160,
+                    "scriptType": "p2pkh",
+                })
+
+        print(f"[CHARGE] Issued {len(final_stas) - existing_count} new + {existing_count} recycled = {len(final_stas)} tokens, {len(fee_pool)} fee UTXOs")
+
+    # Store results - no split phase needed!
     st.stas_utxos = final_stas[:total]
     st.fee_utxos = fee_pool
     st.utxos_prepared = len(st.stas_utxos)
 
-    # Generate a receiver address (new wallet for receiving)
-    receiver_wallet = generate_bsv_wallet(mode)
-    st.receiver_address = receiver_wallet["address"]
-    st.receiver_hash160 = receiver_wallet["hash160"].hex()
+    # Optimization 4: Self-transfer - tokens stay in wallet for reuse next time
+    st.receiver_address = wallet["address"]
+    st.receiver_hash160 = address_hash160
+
+    total_fee_sats = sum(u["satoshis"] for u in fee_pool)
+    print(f"[CHARGE] Final: {st.utxos_prepared} STAS UTXOs, {len(fee_pool)} fee UTXOs ({total_fee_sats} sats)")
 
     if st.running:
+        recycled = st.issue_txid == "recycled"
         await ws.send_json({
             "type": "phase_complete",
             "phase": "power_charge",
             "utxos_prepared": st.utxos_prepared,
             "issue_txid": st.issue_txid,
+            "recycled": recycled,
+            "fee_budget": total_fee_sats,
         })
 
 
@@ -1147,7 +1023,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                 "privkeyHex": privkey_hex,
                 "transfers": transfers,
                 "scheme": token_scheme,
-                "feeRate": 0.1,
+                "feeRate": 0.05,
             })
 
             for result in batch_result["results"]:
