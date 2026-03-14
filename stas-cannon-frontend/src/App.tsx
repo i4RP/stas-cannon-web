@@ -53,12 +53,20 @@ function getEstimatedTimes(mode: AppMode, count: number): { charge: string; laun
       total: `${totalSec < 60 ? `${totalSec}秒` : `${Math.ceil(totalSec / 60)}分`}`,
     }
   }
-  // Real blockchain modes: per-TX overhead ~1.5s for charge (issue+split), ~0.3s launch, ~0.8s confirm
-  const chargeSec = Math.ceil(15 + count * 1.2)
-  const launchSec = Math.ceil(3 + count * 0.3)
-  const confirmSec = Math.ceil(5 + count * 0.5)
+  // Real blockchain modes: per-TX overhead varies by concurrency
+  // With 10 concurrent groups, throughput is ~10x single-chain
+  const concurrency = count >= 1000 ? 10 : 1
+  const chargeSec = Math.ceil(15 + (count / Math.min(count, 500)) * 3) // batched issuance
+  const launchSec = Math.ceil(3 + (count * 0.5) / concurrency) // parallel transfer groups
+  const confirmSec = Math.ceil(5 + (count * 0.3) / concurrency)
   const totalSec = chargeSec + launchSec + confirmSec
-  const fmt = (s: number) => s < 60 ? `約${s}秒` : s < 120 ? `約${Math.ceil(s / 60)}分` : `約${Math.ceil(s / 60)}分`
+  const fmt = (s: number) => {
+    if (s < 60) return `約${s}秒`
+    if (s < 3600) return `約${Math.ceil(s / 60)}分`
+    const h = Math.floor(s / 3600)
+    const m = Math.ceil((s % 3600) / 60)
+    return `約${h}時間${m > 0 ? m + '分' : ''}`
+  }
   return { charge: fmt(chargeSec), launch: fmt(launchSec), confirm: fmt(confirmSec), total: fmt(totalSec) }
 }
 
@@ -91,7 +99,7 @@ const MODE_CONFIG = {
     color: 'bg-red-600',
     textColor: 'text-red-300',
     borderColor: 'border-red-600',
-    transferOptions: [10, 100, 1000],
+    transferOptions: [10, 100, 1000, 10000, 100000, 1000000],
     needsWallet: true,
     explorerBaseUrl: 'https://whatsonchain.com',
     bitailsBaseUrl: 'https://bitails.io',

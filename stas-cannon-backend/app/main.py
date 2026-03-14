@@ -457,8 +457,8 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
 
             elif action == "configure":
                 raw = msg.get("total_transfers")
-                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 10}
-                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000}
+                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000}
+                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000_000}
                 default_total = mode_defaults.get(mode, 1_000_000)
                 max_total = mode_max.get(mode, 1_000_000)
                 total = min(int(raw), max_total) if raw and int(raw) > 0 else default_total
@@ -717,7 +717,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     3. Lower fee rate: 0.05 sat/byte instead of 0.1 (BSV accepts this)
     4. Self-transfer: Send to own wallet so tokens can be reused next time
     """
-    FEE_RATE = 0.02  # Optimization 3: aggressive fee rate for testnet
+    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02  # mainnet: safe rate, testnet: aggressive
 
     st.phase = "power_charge"
     total = st.total_transfers
@@ -865,68 +865,21 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                 await ws.send_json({"type": "error", "message": f"UTXO統合失敗: {e}"})
                 return
 
-        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 5, "status": f"testJPYSトークン {new_count}個 直接発行中..."})
-
-        # Direct multi-output issuance: N destinations of 1 sat each
-        destinations = [{"satoshis": 1, "toHash160": address_hash160} for _ in range(new_count)]
-
-        try:
-            print(f"[CHARGE] Direct issuance: {new_count} tokens, funding={funding_satoshis} sats, feeRate={FEE_RATE}")
-            issue_result = await stas_service_call("/issue", {
-                "privkeyHex": privkey_hex,
-                "fundingUtxo": build_utxo_info(funding_txid, funding_vout, funding_satoshis, funding_locking_script, address_hash160),
-                "scheme": token_scheme,
-                "destinations": destinations,
-                "feeRate": FEE_RATE,
-            })
-        except Exception as e:
-            print(f"[CHARGE] Issue failed: {e}")
-            await ws.send_json({"type": "error", "message": f"トークン発行失敗: {e}"})
-            return
-
-        # Broadcast Contract TX
-        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 30, "status": "Contract TXブロードキャスト中..."})
-        try:
-            contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
-            print(f"[CHARGE] Contract TX broadcast: {contract_txid}")
-        except Exception as e:
-            await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗: {e}"})
-            return
-
-        # Broadcast Issue TX
-        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 60, "status": f"Issue TX ({new_count}トークン) ブロードキャスト中..."})
-        try:
-            issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
-            st.issue_txid = issue_txid
-            print(f"[CHARGE] Issue TX broadcast: {issue_txid}")
-        except Exception as e:
-            await ws.send_json({"type": "error", "message": f"Issue TXブロードキャスト失敗: {e}"})
-            return
-
-        # Collect DSTAS outputs from issue TX (already individual 1-sat tokens!)
-        issue_outputs = issue_result["issueOutputs"]
+        # =====================================================================
+        # Batched issuance: for large counts, issue in batches
+        # =====================================================================
+        MAX_ISSUE_BATCH = 500  # Max tokens per issue TX
         final_stas = list(dstas_1sat_utxos)  # Start with recycled tokens
         fee_pool = []
+        remaining_to_issue = new_count
+        batch_num = 0
+        total_batches = (new_count + MAX_ISSUE_BATCH - 1) // MAX_ISSUE_BATCH
 
-        for out in issue_outputs:
-            if out["scriptType"] == "dstas" and out["satoshis"] == 1:
-                final_stas.append({
-                    "txId": issue_txid,
-                    "vout": out["vout"],
-                    "satoshis": 1,
-                    "lockingScriptHex": out["lockingScriptHex"],
-                    "addressHash160": out.get("addressHash160", address_hash160),
-                    "scriptType": "dstas",
-                })
-            elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
-                fee_pool.append({
-                    "txId": issue_txid,
-                    "vout": out["vout"],
-                    "satoshis": out["satoshis"],
-                    "lockingScriptHex": out["lockingScriptHex"],
-                    "addressHash160": out.get("addressHash160", address_hash160),
-                    "scriptType": "p2pkh",
-                })
+        # Track current funding UTXO (chains across batches)
+        cur_funding_txid = funding_txid
+        cur_funding_vout = funding_vout
+        cur_funding_sats = funding_satoshis
+        cur_funding_script = funding_locking_script
 
         # Add unused P2PKH UTXOs to fee pool (if no consolidation happened)
         if funding_satoshis >= min_required:
@@ -939,6 +892,78 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                     "addressHash160": address_hash160,
                     "scriptType": "p2pkh",
                 })
+
+        while remaining_to_issue > 0 and st.running:
+            batch_count = min(remaining_to_issue, MAX_ISSUE_BATCH)
+            batch_num += 1
+            pct = 5 + int(85 * (batch_num / total_batches))
+
+            await ws.send_json({"type": "progress", "phase": "power_charge", "current": len(final_stas) - existing_count, "total": total, "percent": pct, "status": f"バッチ {batch_num}/{total_batches}: {batch_count}トークン発行中..."})
+
+            destinations = [{"satoshis": 1, "toHash160": address_hash160} for _ in range(batch_count)]
+
+            try:
+                print(f"[CHARGE] Batch {batch_num}/{total_batches}: issuing {batch_count} tokens, funding={cur_funding_sats} sats")
+                issue_result = await stas_service_call("/issue", {
+                    "privkeyHex": privkey_hex,
+                    "fundingUtxo": build_utxo_info(cur_funding_txid, cur_funding_vout, cur_funding_sats, cur_funding_script, address_hash160),
+                    "scheme": token_scheme,
+                    "destinations": destinations,
+                    "feeRate": FEE_RATE,
+                })
+            except Exception as e:
+                print(f"[CHARGE] Issue batch {batch_num} failed: {e}")
+                await ws.send_json({"type": "error", "message": f"トークン発行失敗 (バッチ {batch_num}): {e}"})
+                return
+
+            # Broadcast Contract TX
+            try:
+                contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+                print(f"[CHARGE] Batch {batch_num} Contract TX: {contract_txid}")
+            except Exception as e:
+                await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗 (バッチ {batch_num}): {e}"})
+                return
+
+            # Broadcast Issue TX
+            try:
+                issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
+                st.issue_txid = issue_txid
+                print(f"[CHARGE] Batch {batch_num} Issue TX: {issue_txid}")
+            except Exception as e:
+                await ws.send_json({"type": "error", "message": f"Issue TXブロードキャスト失敗 (バッチ {batch_num}): {e}"})
+                return
+
+            # Collect outputs from this batch
+            issue_outputs = issue_result["issueOutputs"]
+            for out in issue_outputs:
+                if out["scriptType"] == "dstas" and out["satoshis"] == 1:
+                    final_stas.append({
+                        "txId": issue_txid,
+                        "vout": out["vout"],
+                        "satoshis": 1,
+                        "lockingScriptHex": out["lockingScriptHex"],
+                        "addressHash160": out.get("addressHash160", address_hash160),
+                        "scriptType": "dstas",
+                    })
+                elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                    # Chain: use this P2PKH change as funding for next batch
+                    cur_funding_txid = issue_txid
+                    cur_funding_vout = out["vout"]
+                    cur_funding_sats = out["satoshis"]
+                    cur_funding_script = out["lockingScriptHex"]
+
+            remaining_to_issue -= batch_count
+
+        # Last batch's fee change goes to fee pool
+        if cur_funding_sats > 0 and cur_funding_txid == st.issue_txid:
+            fee_pool.append({
+                "txId": cur_funding_txid,
+                "vout": cur_funding_vout,
+                "satoshis": cur_funding_sats,
+                "lockingScriptHex": cur_funding_script,
+                "addressHash160": address_hash160,
+                "scriptType": "p2pkh",
+            })
 
         print(f"[CHARGE] Issued {len(final_stas) - existing_count} new + {existing_count} recycled = {len(final_stas)} tokens, {len(fee_pool)} fee UTXOs")
 
@@ -967,7 +992,13 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
 
 async def run_real_launch(ws: WebSocket, st: CannonState):
-    """Real Phase 2: Build and broadcast STAS transfer transactions."""
+    """Real Phase 2: Build and broadcast STAS transfer transactions.
+
+    For large transfer counts (>=1000), uses concurrent transfer groups:
+    - Splits fee UTXOs into N groups via a split TX
+    - Each group processes transfers sequentially (chaining fee change)
+    - Groups run in parallel with asyncio.gather for ~Nx speedup
+    """
     st.phase = "launch"
     total = len(st.stas_utxos)
     if total == 0:
@@ -980,12 +1011,13 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
         return
 
     privkey_hex = wallet["privkey_bytes"].hex()
+    address_hash160 = wallet["hash160"].hex()
     token_scheme = st.token_scheme
     receiver_hash160 = st.receiver_hash160
+    FEE_RATE = 0.05 if st.mode == "bsvmainnet" else 0.02
 
     await ws.send_json({"type": "phase", "phase": "launch", "total": total})
 
-    # Build phase
     build_start = time.time()
     await ws.send_json({"type": "phase", "phase": "build", "total": total})
 
@@ -994,75 +1026,165 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
     st.tx_errors = 0
     st.tx_ids = []
 
-    # Process transfers sequentially: each transfer's fee change funds the next
-    batch_size = 1
-    for i in range(0, total, batch_size):
-        if not st.running:
-            return
+    # Determine concurrency: use parallel groups for large counts
+    NUM_GROUPS = min(10, total) if total >= 100 else 1
 
-        batch_end = min(i + batch_size, total)
-        batch_stas = st.stas_utxos[i:batch_end]
+    if NUM_GROUPS > 1:
+        # Split fee UTXOs into N groups via a fee-split TX
+        # Each group needs its own fee chain
+        total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
+        per_group_sats = total_fee_sats // NUM_GROUPS
+        transfers_per_group = total // NUM_GROUPS
 
-        transfers = []
-        for j, stas_utxo in enumerate(batch_stas):
+        await ws.send_json({"type": "progress", "phase": "broadcast", "current": 0, "total": total, "percent": 0, "status": f"Fee UTXO を {NUM_GROUPS} グループに分割中..."})
+
+        # Split the main fee UTXO into N outputs
+        try:
+            split_result = await stas_service_call("/split-fee", {
+                "privkeyHex": privkey_hex,
+                "utxos": st.fee_utxos,
+                "numOutputs": NUM_GROUPS,
+                "feeRate": FEE_RATE,
+            })
+            split_txid = await woc_broadcast_tx(split_result["txHex"], st.mode)
+            print(f"[LAUNCH] Fee split TX: {split_txid}, {NUM_GROUPS} groups")
+
+            group_fee_utxos = []
+            for out in split_result["outputs"]:
+                if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                    group_fee_utxos.append({
+                        "txId": split_txid,
+                        "vout": out["vout"],
+                        "satoshis": out["satoshis"],
+                        "lockingScriptHex": out["lockingScriptHex"],
+                        "addressHash160": out.get("addressHash160", address_hash160),
+                        "scriptType": "p2pkh",
+                    })
+        except Exception as e:
+            print(f"[LAUNCH] Fee split failed, falling back to sequential: {e}")
+            NUM_GROUPS = 1
+            group_fee_utxos = []
+
+    if NUM_GROUPS <= 1:
+        # Sequential mode (original behavior)
+        for i in range(0, total):
+            if not st.running:
+                return
+
+            stas_utxo = st.stas_utxos[i]
             if not st.fee_utxos:
                 st.tx_errors += total - st.tx_broadcast
                 await ws.send_json({"type": "error", "message": f"Fee UTXO不足 ({st.tx_broadcast}/{total} completed)"})
                 break
+
             fee_utxo = st.fee_utxos.pop(0)
-            transfers.append({
-                "stasUtxo": stas_utxo,
-                "feeUtxo": fee_utxo,
-                "toHash160": receiver_hash160,
-            })
+            transfers = [{"stasUtxo": stas_utxo, "feeUtxo": fee_utxo, "toHash160": receiver_hash160}]
 
-        if not transfers:
-            break
+            try:
+                batch_result = await stas_service_call("/batch-transfer", {
+                    "privkeyHex": privkey_hex,
+                    "transfers": transfers,
+                    "scheme": token_scheme,
+                    "feeRate": FEE_RATE,
+                })
 
-        try:
-            batch_result = await stas_service_call("/batch-transfer", {
-                "privkeyHex": privkey_hex,
-                "transfers": transfers,
-                "scheme": token_scheme,
-                "feeRate": 0.02,
-            })
+                for result in batch_result["results"]:
+                    try:
+                        txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                        st.tx_broadcast += 1
+                        st.tx_ids.append(txid)
+                        for out in result["outputs"]:
+                            if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                                st.fee_utxos.append({
+                                    "txId": txid, "vout": out["vout"],
+                                    "satoshis": out["satoshis"],
+                                    "lockingScriptHex": out["lockingScriptHex"],
+                                    "addressHash160": out.get("addressHash160", address_hash160),
+                                    "scriptType": "p2pkh",
+                                })
+                    except Exception:
+                        st.tx_errors += 1
+            except Exception as e:
+                st.tx_errors += 1
 
-            for result in batch_result["results"]:
+            elapsed = time.time() - broadcast_start
+            st.tps = st.tx_broadcast / elapsed if elapsed > 0 else 0
+            if i % max(1, total // 100) == 0 or i == total - 1:
+                await ws.send_json({
+                    "type": "progress", "phase": "broadcast",
+                    "current": st.tx_broadcast, "total": total,
+                    "percent": round(st.tx_broadcast / total * 100, 1),
+                    "tps": round(st.tps, 1), "errors": st.tx_errors,
+                })
+    else:
+        # Concurrent transfer groups
+        # Divide STAS UTXOs into groups
+        stas_groups = [[] for _ in range(NUM_GROUPS)]
+        for idx, utxo in enumerate(st.stas_utxos):
+            stas_groups[idx % NUM_GROUPS].append(utxo)
+
+        # Shared counters (protected by lock)
+        lock = asyncio.Lock()
+
+        async def process_group(group_idx: int, stas_list: list, fee_utxo: dict):
+            """Process a single transfer group sequentially."""
+            current_fee = fee_utxo
+            for stas_utxo in stas_list:
+                if not st.running:
+                    return
+                transfers = [{"stasUtxo": stas_utxo, "feeUtxo": current_fee, "toHash160": receiver_hash160}]
                 try:
-                    txid = await woc_broadcast_tx(result["txHex"], st.mode)
-                    st.tx_broadcast += 1
-                    st.tx_ids.append(txid)
+                    batch_result = await stas_service_call("/batch-transfer", {
+                        "privkeyHex": privkey_hex,
+                        "transfers": transfers,
+                        "scheme": token_scheme,
+                        "feeRate": FEE_RATE,
+                    })
+                    for result in batch_result["results"]:
+                        try:
+                            txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                            async with lock:
+                                st.tx_broadcast += 1
+                                st.tx_ids.append(txid)
+                            # Chain fee change for next transfer
+                            for out in result["outputs"]:
+                                if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                                    current_fee = {
+                                        "txId": txid, "vout": out["vout"],
+                                        "satoshis": out["satoshis"],
+                                        "lockingScriptHex": out["lockingScriptHex"],
+                                        "addressHash160": out.get("addressHash160", address_hash160),
+                                        "scriptType": "p2pkh",
+                                    }
+                                    break
+                        except Exception:
+                            async with lock:
+                                st.tx_errors += 1
+                except Exception:
+                    async with lock:
+                        st.tx_errors += 1
 
-                    # Collect fee change outputs for reuse
-                    for out in result["outputs"]:
-                        if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
-                            st.fee_utxos.append({
-                                "txId": txid,
-                                "vout": out["vout"],
-                                "satoshis": out["satoshis"],
-                                "lockingScriptHex": out["lockingScriptHex"],
-                                "addressHash160": out.get("addressHash160", wallet["hash160"].hex()),
-                                "scriptType": "p2pkh",
-                            })
-                except Exception as e:
-                    st.tx_errors += 1
+        # Progress reporter task
+        async def report_progress():
+            while st.running and st.tx_broadcast < total:
+                elapsed = time.time() - broadcast_start
+                st.tps = st.tx_broadcast / elapsed if elapsed > 0 else 0
+                await ws.send_json({
+                    "type": "progress", "phase": "broadcast",
+                    "current": st.tx_broadcast, "total": total,
+                    "percent": round(st.tx_broadcast / total * 100, 1),
+                    "tps": round(st.tps, 1), "errors": st.tx_errors,
+                })
+                await asyncio.sleep(1.0)
 
-        except Exception as e:
-            st.tx_errors += len(transfers)
-            await ws.send_json({"type": "progress", "phase": "broadcast", "current": st.tx_broadcast, "total": total, "percent": round(st.tx_broadcast / total * 100, 1), "status": f"Batch error: {e}"})
+        # Launch all groups + progress reporter concurrently
+        tasks = []
+        for g_idx in range(NUM_GROUPS):
+            if g_idx < len(group_fee_utxos) and stas_groups[g_idx]:
+                tasks.append(process_group(g_idx, stas_groups[g_idx], group_fee_utxos[g_idx]))
+        tasks.append(report_progress())
 
-        elapsed = time.time() - broadcast_start
-        st.tps = st.tx_broadcast / elapsed if elapsed > 0 else 0
-
-        await ws.send_json({
-            "type": "progress",
-            "phase": "broadcast",
-            "current": st.tx_broadcast,
-            "total": total,
-            "percent": round(st.tx_broadcast / total * 100, 1),
-            "tps": round(st.tps, 1),
-            "errors": st.tx_errors,
-        })
+        await asyncio.gather(*tasks)
 
     st.build_duration = time.time() - build_start
     st.broadcast_duration = time.time() - broadcast_start
@@ -1082,7 +1204,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
 
 async def run_real_confirm(ws: WebSocket, st: CannonState):
-    """Real Phase 3: Verify transactions on-chain."""
+    """Real Phase 3: Verify transactions on-chain with concurrency."""
     st.phase = "confirm"
     total = len(st.tx_ids)
     if total == 0:
@@ -1092,26 +1214,39 @@ async def run_real_confirm(ws: WebSocket, st: CannonState):
     await ws.send_json({"type": "phase", "phase": "confirm", "total": total})
 
     confirmed = 0
-    for i, txid in enumerate(st.tx_ids):
-        if not st.running:
-            return
+    checked = 0
+    lock = asyncio.Lock()
 
-        try:
-            tx_status = await woc_get_tx_status(txid, st.mode)
-            if "error" not in tx_status:
-                confirmed += 1
-        except Exception:
-            pass
+    CONCURRENCY = min(20, total)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
 
-        st.tx_confirmed = confirmed
-        if (i + 1) % max(1, total // 50) == 0 or i == total - 1:
+    async def check_tx(txid: str):
+        nonlocal confirmed, checked
+        async with semaphore:
+            try:
+                tx_status = await woc_get_tx_status(txid, st.mode)
+                if "error" not in tx_status:
+                    async with lock:
+                        confirmed += 1
+            except Exception:
+                pass
+            async with lock:
+                checked += 1
+
+    # Launch all checks concurrently (bounded by semaphore)
+    tasks = [check_tx(txid) for txid in st.tx_ids]
+
+    # Progress reporter
+    async def report_progress():
+        while checked < total:
             await ws.send_json({
-                "type": "progress",
-                "phase": "confirm",
-                "current": i + 1,
-                "total": total,
-                "percent": round((i + 1) / total * 100, 1),
+                "type": "progress", "phase": "confirm",
+                "current": checked, "total": total,
+                "percent": round(checked / total * 100, 1),
             })
+            await asyncio.sleep(1.0)
+
+    await asyncio.gather(asyncio.gather(*tasks), report_progress())
 
     st.tx_confirmed = confirmed
     if st.running:

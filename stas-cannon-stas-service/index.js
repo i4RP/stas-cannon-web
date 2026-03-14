@@ -37,7 +37,7 @@ const {
 } = require("dxs-stas-sdk/dist/script/read/locking-script-reader");
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "100mb" }));
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -443,6 +443,73 @@ app.post("/consolidate", (req, res) => {
 
     res.json({ txHex, txId: tx.Id, outputs: txOutputs });
   } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- Split Fee: Consolidate UTXOs and split into N equal outputs ---
+/**
+ * POST /split-fee
+ * Consolidates multiple P2PKH UTXOs and splits into N equal outputs.
+ * Used for creating independent fee chains for concurrent transfers.
+ * Body: {
+ *   privkeyHex: string,
+ *   utxos: [{ txId, vout, satoshis, lockingScriptHex, addressHash160, scriptType }],
+ *   numOutputs: number,
+ *   feeRate?: number
+ * }
+ * Returns: { txHex, txId, outputs }
+ */
+app.post("/split-fee", (req, res) => {
+  try {
+    const { privkeyHex, utxos, numOutputs, feeRate } = req.body;
+    const owner = privkeyFromHex(privkeyHex);
+    const rate = feeRate || 0.1;
+    const num = numOutputs || 2;
+
+    const txBuilder = TransactionBuilder.init();
+    let totalInputSats = 0;
+    for (const utxo of utxos) {
+      const outPoint = buildOutPoint(utxo);
+      txBuilder.addInput(outPoint, owner);
+      totalInputSats += utxo.satoshis;
+    }
+
+    const ownerAddress = owner.Address;
+    // Estimate fee: ~34 bytes per output + ~148 bytes per input + 10 overhead
+    const estimatedTxSize = utxos.length * 148 + num * 34 + 10;
+    const estimatedFee = Math.ceil(estimatedTxSize * rate) + 100;
+    const availableSats = totalInputSats - estimatedFee;
+    const perOutputSats = Math.floor(availableSats / num);
+
+    if (perOutputSats < 1) {
+      throw new Error(`Insufficient funds: ${totalInputSats} sats for ${num} outputs (need ~${estimatedFee} fee)`);
+    }
+
+    // Add N equal outputs
+    for (let i = 0; i < num; i++) {
+      txBuilder.addP2PkhOutput(perOutputSats, ownerAddress);
+    }
+
+    // Any remainder goes as change (covers fee)
+    const remainder = availableSats - perOutputSats * num;
+    if (remainder > 0) {
+      txBuilder.addP2PkhOutput(remainder, ownerAddress);
+    }
+
+    const txHex = txBuilder.sign().toHex();
+    const tx = TransactionReader.readHex(txHex);
+    const txOutputs = tx.Outputs.map((out, idx) => ({
+      vout: idx,
+      satoshis: out.Satoshis,
+      scriptType: "p2pkh",
+      lockingScriptHex: toHex(out.LockingScript),
+      addressHash160: out.Address ? toHex(out.Address.Hash160) : null,
+    }));
+
+    res.json({ txHex, txId: tx.Id, outputs: txOutputs });
+  } catch (err) {
+    console.error(`[SPLIT-FEE ERROR] ${err.message}`);
     res.status(400).json({ error: err.message });
   }
 });
