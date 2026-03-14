@@ -40,6 +40,7 @@ function App() {
   const [configured, setConfigured] = useState(false)
   const [chargeComplete, setChargeComplete] = useState(false)
   const [launchComplete, setLaunchComplete] = useState(false)
+  const [txIds, setTxIds] = useState<string[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -147,6 +148,9 @@ function App() {
             buildDuration: msg.build_duration || prev.buildDuration,
             broadcastDuration: msg.broadcast_duration || prev.broadcastDuration,
           }))
+          if (msg.tx_ids) {
+            setTxIds(msg.tx_ids)
+          }
           break
 
         case 'stopped':
@@ -452,8 +456,42 @@ function App() {
               <StatBox label="成功率" value={stats.txBroadcast > 0 ? `${((stats.txBroadcast - stats.txErrors) / stats.txBroadcast * 100).toFixed(2)}%` : '—'} />
             </div>
 
+            {/* Transaction Explorer Links */}
+            {txIds.length > 0 && (
+              <div className="text-left max-w-3xl mx-auto w-full space-y-3">
+                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">トランザクション詳細</h3>
+                <p className="text-xs text-gray-500">
+                  {formatNumber(stats.txBroadcast)} 件中 {txIds.length} 件を表示 — WoC / Bitails テストネットエクスプローラーで確認
+                </p>
+                <div className="max-h-64 overflow-y-auto space-y-1 rounded-lg bg-gray-800/50 p-3">
+                  {txIds.map((txid, i) => (
+                    <div key={txid} className="flex items-center gap-2 text-xs font-mono group hover:bg-gray-700/50 rounded px-2 py-1">
+                      <span className="text-gray-600 w-8 text-right shrink-0">#{i + 1}</span>
+                      <span className="text-gray-400 truncate flex-1">{txid}</span>
+                      <a
+                        href={`https://test.whatsonchain.com/tx/${txid}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-400 hover:text-blue-300 shrink-0 hover:underline"
+                      >
+                        WoC
+                      </a>
+                      <a
+                        href={`https://test.bitails.io/tx/${txid}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-emerald-400 hover:text-emerald-300 shrink-0 hover:underline"
+                      >
+                        Bitails
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <button
-              onClick={() => { setPhase('idle'); setProgress(null); setConfigured(false); setChargeComplete(false); setLaunchComplete(false); }}
+              onClick={() => { setPhase('idle'); setProgress(null); setConfigured(false); setChargeComplete(false); setLaunchComplete(false); setTxIds([]); }}
               className="px-8 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg font-medium transition-colors"
             >
               リセット

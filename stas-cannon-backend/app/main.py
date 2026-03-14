@@ -40,6 +40,7 @@ class CannonState:
         self.sender_address = ""
         self.receiver_address = ""
         self.running = False
+        self.tx_ids: list[str] = []
 
 
 def generate_address():
@@ -52,6 +53,11 @@ def generate_address():
         num, rem = divmod(num, 58)
         addr += alphabet[rem]
     return addr[:34]
+
+
+def generate_txid():
+    """Generate a simulated BSV transaction ID (64-char hex)."""
+    return secrets.token_hex(32)
 
 
 @app.get("/healthz")
@@ -131,6 +137,7 @@ async def websocket_cannon(websocket: WebSocket):
                     "tps": round(st.tps, 0),
                     "build_duration": round(st.build_duration, 2),
                     "broadcast_duration": round(st.broadcast_duration, 2),
+                    "tx_ids": st.tx_ids,
                 })
 
             elif action == "stop":
@@ -251,6 +258,9 @@ async def run_launch(ws: WebSocket, st: CannonState):
 
     st.tx_broadcast = total
     st.broadcast_duration = time.time() - broadcast_start
+
+    # Generate simulated transaction IDs
+    st.tx_ids = [generate_txid() for _ in range(min(total, 100))]
 
     if st.running:
         avg_tps = round(st.tx_broadcast / st.broadcast_duration, 0) if st.broadcast_duration > 0 else 0
