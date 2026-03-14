@@ -717,7 +717,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     3. Lower fee rate: 0.05 sat/byte instead of 0.1 (BSV accepts this)
     4. Self-transfer: Send to own wallet so tokens can be reused next time
     """
-    FEE_RATE = 0.05  # Optimization 3: lower fee rate
+    FEE_RATE = 0.02  # Optimization 3: aggressive fee rate for testnet
 
     st.phase = "power_charge"
     total = st.total_transfers
@@ -1024,7 +1024,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                 "privkeyHex": privkey_hex,
                 "transfers": transfers,
                 "scheme": token_scheme,
-                "feeRate": 0.05,
+                "feeRate": 0.02,
             })
 
             for result in batch_result["results"]:
