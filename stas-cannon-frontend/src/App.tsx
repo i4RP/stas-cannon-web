@@ -89,6 +89,7 @@ function App({ mode }: { mode: AppMode }) {
   const [chargeComplete, setChargeComplete] = useState(false)
   const [utxosPrepared, setUtxosPrepared] = useState(0)
   const [launchComplete, setLaunchComplete] = useState(false)
+  const [transfersSent, setTransfersSent] = useState(0)
   const [txIds, setTxIds] = useState<string[]>([])
 
   // Wallet state for testnet/mainnet
@@ -179,6 +180,7 @@ function App({ mode }: { mode: AppMode }) {
           }
           if (msg.phase === 'launch') {
             setLaunchComplete(true)
+            setTransfersSent(msg.tx_broadcast || 0)
             setPhase('idle')
             setStats(prev => ({
               ...prev,
@@ -555,7 +557,7 @@ function App({ mode }: { mode: AppMode }) {
                 {mode === 'localtest' ? '送金時間（10s）' : '送金'}
               </h3>
               {launchComplete && (
-                <span className="text-green-400 text-sm">{formatNumber(stats.txBroadcast)} 送信完了</span>
+                <span className="text-green-400 text-sm">{formatNumber(transfersSent)} 送信完了</span>
               )}
             </div>
 
