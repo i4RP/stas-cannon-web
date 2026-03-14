@@ -170,7 +170,7 @@ app.post("/issue", (req, res) => {
       issueOutputs,
     });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message, devMessage: err.devMessage || null });
   }
 });
 
@@ -226,7 +226,8 @@ app.post("/split", (req, res) => {
 
     res.json({ txHex, txId: tx.Id, outputs });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    console.error(`[SPLIT ERROR] message=${err.message}, devMessage=${err.devMessage || 'N/A'}`);
+    res.status(400).json({ error: err.message, devMessage: err.devMessage || null });
   }
 });
 
@@ -384,6 +385,51 @@ app.post("/p2pkh-split", (req, res) => {
         feeOutputIdx,
       );
     }
+
+    const txHex = txBuilder.sign().toHex();
+    const tx = TransactionReader.readHex(txHex);
+    const txOutputs = tx.Outputs.map((out, idx) => ({
+      vout: idx,
+      satoshis: out.Satoshis,
+      scriptType: "p2pkh",
+      lockingScriptHex: toHex(out.LockingScript),
+      addressHash160: out.Address ? toHex(out.Address.Hash160) : null,
+    }));
+
+    res.json({ txHex, txId: tx.Id, outputs: txOutputs });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /consolidate
+ * Merge multiple P2PKH UTXOs into a single output.
+ * Body: {
+ *   privkeyHex: string,
+ *   utxos: [{ txId, vout, satoshis, lockingScriptHex, addressHash160, scriptType }],
+ *   feeRate?: number
+ * }
+ * Returns: { txHex, txId, outputs }
+ */
+app.post("/consolidate", (req, res) => {
+  try {
+    const { privkeyHex, utxos, feeRate } = req.body;
+    const owner = privkeyFromHex(privkeyHex);
+    const rate = feeRate || 0.1;
+
+    const txBuilder = TransactionBuilder.init();
+    let totalInputSats = 0;
+    for (const utxo of utxos) {
+      const outPoint = buildOutPoint(utxo);
+      txBuilder.addInput(outPoint, owner);
+      totalInputSats += utxo.satoshis;
+    }
+
+    const ownerAddress = owner.Address;
+    // Add single output with all funds minus fee
+    const feeOutputIdx = 0;
+    txBuilder.addChangeOutputWithFee(ownerAddress, totalInputSats, rate, feeOutputIdx);
 
     const txHex = txBuilder.sign().toHex();
     const tx = TransactionReader.readHex(txHex);
