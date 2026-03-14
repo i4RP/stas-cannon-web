@@ -256,8 +256,12 @@ STAS_SERVICE_URL = os.environ.get("STAS_SERVICE_URL", "http://localhost:3001")
 
 async def stas_service_call(endpoint: str, payload: dict) -> dict:
     """Call the Node.js STAS service."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    import logging
+    logger = logging.getLogger("stas_service")
+    logger.info(f"STAS call: POST {endpoint}")
+    async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(f"{STAS_SERVICE_URL}{endpoint}", json=payload)
+        logger.info(f"STAS response: {resp.status_code} ({len(resp.content)} bytes)")
         data = resp.json()
         if resp.status_code != 200:
             raise RuntimeError(data.get("error", "STAS service error"))
@@ -453,7 +457,11 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
 
             elif action == "configure":
                 raw = msg.get("total_transfers")
-                total = int(raw) if raw and int(raw) > 0 else 1_000_000
+                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 10}
+                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000}
+                default_total = mode_defaults.get(mode, 1_000_000)
+                max_total = mode_max.get(mode, 1_000_000)
+                total = min(int(raw), max_total) if raw and int(raw) > 0 else default_total
                 prev_wallet = st.wallet
                 prev_mode = st.mode
                 st = CannonState()
@@ -728,24 +736,38 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
         await ws.send_json({"type": "error", "message": "UTXOがありません。BSVを送金してください。"})
         return
 
-    # Find the largest P2PKH UTXO for funding
+    # Find a usable P2PKH UTXO for funding (try largest first, skip if TX not found)
     sorted_utxos = sorted(raw_utxos, key=lambda u: u.get("value", 0), reverse=True)
-    funding_utxo_raw = sorted_utxos[0]
-    funding_txid = funding_utxo_raw["tx_hash"]
-    funding_vout = funding_utxo_raw["tx_pos"]
-    funding_satoshis = funding_utxo_raw["value"]
+    funding_utxo_raw = None
+    funding_txid = None
+    funding_vout = None
+    funding_satoshis = None
+    funding_locking_script = None
+    usable_utxo_index = 0
+
+    for idx, candidate in enumerate(sorted_utxos):
+        try:
+            await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 1, "status": f"UTXO検証中... ({idx+1}/{len(sorted_utxos)})"})
+            tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+            tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
+            output = tx_info["outputs"][candidate["tx_pos"]]
+            # Only use P2PKH outputs (not STAS outputs from previous runs)
+            if output.get("scriptType") == "p2pkh":
+                funding_utxo_raw = candidate
+                funding_txid = candidate["tx_hash"]
+                funding_vout = candidate["tx_pos"]
+                funding_satoshis = candidate["value"]
+                funding_locking_script = output["lockingScriptHex"]
+                usable_utxo_index = idx
+                break
+        except Exception:
+            continue
+
+    if not funding_utxo_raw:
+        await ws.send_json({"type": "error", "message": "利用可能なP2PKH UTXOが見つかりません。BSVを送金してください。"})
+        return
 
     await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 1, "status": f"Funding UTXO: {funding_satoshis} sats"})
-
-    # Step 2: Get raw TX to extract locking script
-    try:
-        funding_tx_hex = await woc_get_tx_hex(funding_txid, mode)
-        funding_tx_info = await stas_service_call("/parse-tx", {"txHex": funding_tx_hex})
-        funding_output = funding_tx_info["outputs"][funding_vout]
-        funding_locking_script = funding_output["lockingScriptHex"]
-    except Exception as e:
-        await ws.send_json({"type": "error", "message": f"TX取得失敗: {e}"})
-        return
 
     # Step 3: Issue testJPYS token
     await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 5, "status": "testJPYSトークン発行中..."})
@@ -763,7 +785,13 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
     # Issue all tokens to ourselves in one output
     issue_satoshis = total  # 1 sat per token
+    # Estimate minimum required: token sats + fees (~2000 sats overhead)
+    min_required = issue_satoshis + 2000
+    if funding_satoshis < min_required:
+        await ws.send_json({"type": "error", "message": f"資金不足: {funding_satoshis} sats < 必要量 {min_required} sats (トークン{issue_satoshis} + 手数料)"})
+        return
     try:
+        print(f"[CHARGE] Calling /issue with {issue_satoshis} sats, funding={funding_satoshis}")
         issue_result = await stas_service_call("/issue", {
             "privkeyHex": privkey_hex,
             "fundingUtxo": build_utxo_info(funding_txid, funding_vout, funding_satoshis, funding_locking_script, address_hash160),
@@ -771,7 +799,9 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             "destinations": [{"satoshis": issue_satoshis, "toHash160": address_hash160}],
             "feeRate": 0.1,
         })
+        print(f"[CHARGE] Issue result keys: {list(issue_result.keys())}")
     except Exception as e:
+        print(f"[CHARGE] Issue failed: {e}")
         await ws.send_json({"type": "error", "message": f"トークン発行失敗: {e}"})
         return
 
@@ -779,7 +809,9 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 10, "status": "Contract TXブロードキャスト中..."})
     try:
         contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+        print(f"[CHARGE] Contract TX broadcast: {contract_txid}")
     except Exception as e:
+        print(f"[CHARGE] Contract TX broadcast failed: {e}")
         await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗: {e}"})
         return
 
@@ -788,7 +820,9 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     try:
         issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
         st.issue_txid = issue_txid
+        print(f"[CHARGE] Issue TX broadcast: {issue_txid}")
     except Exception as e:
+        print(f"[CHARGE] Issue TX broadcast failed: {e}")
         await ws.send_json({"type": "error", "message": f"Issue TXブロードキャスト失敗: {e}"})
         return
 
@@ -807,9 +841,11 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             stas_output = out
             break
 
+    print(f"[CHARGE] Issue outputs: {[(o['scriptType'], o['satoshis']) for o in issue_outputs]}")
     if not stas_output:
         await ws.send_json({"type": "error", "message": "Issue TXにDSTAS出力が見つかりません"})
         return
+    print(f"[CHARGE] STAS output: vout={stas_output['vout']}, sats={stas_output['satoshis']}")
 
     # Find the change output from issue TX for fees
     fee_change_output = None
@@ -841,8 +877,8 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             "scriptType": "p2pkh",
         })
 
-    # Also add remaining wallet UTXOs as fee sources
-    for u in sorted_utxos[1:]:
+    # Also add remaining wallet UTXOs as fee sources (skip ones we already tried and failed)
+    for u in sorted_utxos[usable_utxo_index+1:]:
         if u["value"] > 0:
             u_txid = u["tx_hash"]
             u_vout = u["tx_pos"]
@@ -861,6 +897,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             except Exception:
                 pass
 
+    print(f"[CHARGE] Fee pool size: {len(fee_pool)}, pending_stas: {len(pending_stas)}")
     split_round = 0
     while pending_stas and len(final_stas) < total and st.running:
         split_round += 1
@@ -974,6 +1011,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
             except Exception as e:
                 st.tx_errors += 1
+                print(f"[CHARGE] Split error: {e}")
                 await ws.send_json({"type": "progress", "phase": "power_charge", "current": len(final_stas), "total": total, "percent": round(len(final_stas) / total * 100, 1), "status": f"Split error: {e}"})
                 # Put the STAS UTXO back for retry
                 next_pending.append(stas_utxo)
@@ -992,6 +1030,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
         pending_stas = next_pending
 
     # Store results
+    print(f"[CHARGE] Final: {len(final_stas)} STAS UTXOs, {len(fee_pool)} fee UTXOs")
     st.stas_utxos = final_stas[:total]
     st.fee_utxos = fee_pool
     st.utxos_prepared = len(st.stas_utxos)

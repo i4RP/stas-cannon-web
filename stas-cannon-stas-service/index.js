@@ -39,6 +39,16 @@ const {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - START`);
+  res.on('finish', () => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
+
 const PORT = process.env.STAS_SERVICE_PORT || 3001;
 
 // --- Helpers ---

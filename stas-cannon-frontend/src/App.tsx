@@ -15,6 +15,7 @@ interface ProgressData {
   percent: number
   tps?: number
   errors?: number
+  status?: string
 }
 
 interface Stats {
@@ -86,6 +87,7 @@ function App({ mode }: { mode: AppMode }) {
   const [connected, setConnected] = useState(false)
   const [configured, setConfigured] = useState(false)
   const [chargeComplete, setChargeComplete] = useState(false)
+  const [utxosPrepared, setUtxosPrepared] = useState(0)
   const [launchComplete, setLaunchComplete] = useState(false)
   const [txIds, setTxIds] = useState<string[]>([])
 
@@ -94,6 +96,7 @@ function App({ mode }: { mode: AppMode }) {
   const [walletLoading, setWalletLoading] = useState(false)
   const [wifInput, setWifInput] = useState('')
   const [walletError, setWalletError] = useState('')
+  const [phaseError, setPhaseError] = useState('')
 
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -152,6 +155,7 @@ function App({ mode }: { mode: AppMode }) {
             percent: msg.percent,
             tps: msg.tps,
             errors: msg.errors,
+            status: msg.status,
           })
           if (msg.phase === 'power_charge') {
             setStats(prev => ({ ...prev }))
@@ -170,6 +174,7 @@ function App({ mode }: { mode: AppMode }) {
         case 'phase_complete':
           if (msg.phase === 'power_charge') {
             setChargeComplete(true)
+            setUtxosPrepared(msg.utxos_prepared || 0)
             setPhase('idle')
           }
           if (msg.phase === 'launch') {
@@ -232,6 +237,11 @@ function App({ mode }: { mode: AppMode }) {
           setWalletLoading(false)
           break
 
+        case 'error':
+          setPhaseError(msg.message)
+          setPhase('idle')
+          break
+
         case 'stopped':
           setPhase('idle')
           break
@@ -265,6 +275,7 @@ function App({ mode }: { mode: AppMode }) {
 
   const handleCharge = () => {
     setProgress(null)
+    setPhaseError('')
     setStats({
       txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
       tps: 0, buildDuration: 0, broadcastDuration: 0, totalDuration: 0,
@@ -492,14 +503,14 @@ function App({ mode }: { mode: AppMode }) {
               </div>
               <h3 className="text-xl font-bold">チャージ</h3>
               {chargeComplete && (
-                <span className="text-green-400 text-sm">{formatNumber(totalTransfers)} UTXOs 準備完了</span>
+                <span className="text-green-400 text-sm">{formatNumber(utxosPrepared)} UTXOs 準備完了</span>
               )}
             </div>
 
             {phase === 'power_charge' && progress && (
               <>
                 <div className="flex items-center justify-between text-sm">
-                  <span className="text-gray-400">UTXO分割中...</span>
+                  <span className="text-gray-400">{progress.status || 'UTXO分割中...'}</span>
                   <span className="font-bold tabular-nums">{progress.percent.toFixed(1)}%</span>
                 </div>
                 <div className="w-full bg-gray-800 rounded-full h-3 overflow-hidden">
@@ -508,10 +519,13 @@ function App({ mode }: { mode: AppMode }) {
                     style={{ width: `${Math.min(progress.percent, 100)}%` }}
                   />
                 </div>
-                <div className="text-sm text-gray-500">
-                  {formatNumber(progress.current)} / {formatNumber(progress.total)} UTXOs
-                </div>
               </>
+            )}
+
+            {phaseError && (
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-400 text-sm">
+                エラー: {phaseError}
+              </div>
             )}
 
             {!chargeComplete && phase !== 'power_charge' && (
