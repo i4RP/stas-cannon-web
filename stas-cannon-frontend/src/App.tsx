@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import './App.css'
 
 const API_URL = import.meta.env.VITE_API_URL || ''
+
+export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet'
 
 type Phase = 'idle' | 'power_charge' | 'build' | 'broadcast' | 'confirm' | 'done'
 
@@ -27,9 +30,53 @@ interface Stats {
   receiverAddress: string
 }
 
-function App() {
+interface WalletInfo {
+  address: string
+  balanceBsv: number
+  balanceSatoshis: number
+  funded: boolean
+}
+
+const MODE_CONFIG = {
+  localtest: {
+    label: 'Local Test',
+    sublabel: 'シミュレーション',
+    color: 'bg-gray-600',
+    textColor: 'text-gray-300',
+    borderColor: 'border-gray-600',
+    transferOptions: [1000, 10000, 100000, 1000000],
+    needsWallet: false,
+    explorerBaseUrl: 'https://test.whatsonchain.com',
+    bitailsBaseUrl: 'https://test.bitails.io',
+  },
+  bsvtestnet: {
+    label: 'Testnet',
+    sublabel: 'テストネット',
+    color: 'bg-yellow-600',
+    textColor: 'text-yellow-300',
+    borderColor: 'border-yellow-600',
+    transferOptions: [10, 100, 1000, 10000],
+    needsWallet: true,
+    explorerBaseUrl: 'https://test.whatsonchain.com',
+    bitailsBaseUrl: 'https://test.bitails.io',
+  },
+  bsvmainnet: {
+    label: 'Mainnet',
+    sublabel: 'メインネット',
+    color: 'bg-red-600',
+    textColor: 'text-red-300',
+    borderColor: 'border-red-600',
+    transferOptions: [10, 100, 1000],
+    needsWallet: true,
+    explorerBaseUrl: 'https://whatsonchain.com',
+    bitailsBaseUrl: 'https://bitails.io',
+  },
+}
+
+function App({ mode }: { mode: AppMode }) {
+  const config = MODE_CONFIG[mode]
   const [phase, setPhase] = useState<Phase>('idle')
-  const [totalTransfers, setTotalTransfers] = useState(1_000_000)
+  const [totalTransfers, setTotalTransfers] = useState(config.transferOptions[config.transferOptions.length - 1])
   const [progress, setProgress] = useState<ProgressData | null>(null)
   const [stats, setStats] = useState<Stats>({
     txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
@@ -41,11 +88,17 @@ function App() {
   const [chargeComplete, setChargeComplete] = useState(false)
   const [launchComplete, setLaunchComplete] = useState(false)
   const [txIds, setTxIds] = useState<string[]>([])
+
+  // Wallet state for testnet/mainnet
+  const [wallet, setWallet] = useState<WalletInfo | null>(null)
+  const [walletLoading, setWalletLoading] = useState(false)
+  const [wifInput, setWifInput] = useState('')
+  const [walletError, setWalletError] = useState('')
+
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const connectWs = useCallback(() => {
-    // Close any existing connection first
     if (wsRef.current) {
       wsRef.current.onclose = null
       wsRef.current.close()
@@ -57,8 +110,8 @@ function App() {
     }
 
     const wsUrl = API_URL
-      ? API_URL.replace('http', 'ws') + '/ws/cannon'
-      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/cannon`
+      ? API_URL.replace('http', 'ws') + `/ws/cannon?mode=${mode}`
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/cannon?mode=${mode}`
     const ws = new WebSocket(wsUrl)
 
     ws.onopen = () => {
@@ -153,6 +206,32 @@ function App() {
           }
           break
 
+        case 'wallet_created':
+          setWallet({
+            address: msg.address,
+            balanceBsv: msg.balance_bsv || 0,
+            balanceSatoshis: msg.balance_satoshis || 0,
+            funded: msg.funded || false,
+          })
+          setWalletLoading(false)
+          setWalletError('')
+          break
+
+        case 'wallet_balance':
+          setWallet(prev => prev ? {
+            ...prev,
+            balanceBsv: msg.balance_bsv,
+            balanceSatoshis: msg.balance_satoshis,
+            funded: msg.funded,
+          } : null)
+          setWalletLoading(false)
+          break
+
+        case 'wallet_error':
+          setWalletError(msg.message)
+          setWalletLoading(false)
+          break
+
         case 'stopped':
           setPhase('idle')
           break
@@ -160,7 +239,7 @@ function App() {
     }
 
     wsRef.current = ws
-  }, [])
+  }, [mode])
 
   useEffect(() => {
     connectWs()
@@ -208,8 +287,27 @@ function App() {
     wsRef.current?.send(JSON.stringify({ action: 'stop' }))
   }
 
+  const handleCreateWallet = () => {
+    setWalletLoading(true)
+    setWalletError('')
+    wsRef.current?.send(JSON.stringify({ action: 'create_wallet' }))
+  }
+
+  const handleImportWallet = () => {
+    if (!wifInput.trim()) return
+    setWalletLoading(true)
+    setWalletError('')
+    wsRef.current?.send(JSON.stringify({ action: 'import_wallet', wif: wifInput.trim() }))
+  }
+
+  const handleCheckBalance = () => {
+    setWalletLoading(true)
+    wsRef.current?.send(JSON.stringify({ action: 'check_balance' }))
+  }
+
   const formatNumber = (n: number) => n.toLocaleString()
   const isRunning = phase !== 'idle' && phase !== 'done'
+  const canProceed = mode === 'localtest' || (wallet?.funded ?? false)
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -217,22 +315,116 @@ function App() {
       <header className="border-b border-gray-800 bg-gray-950/80 backdrop-blur-sm sticky top-0 z-10">
         <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center font-bold text-lg">
+            <Link to="/" className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center font-bold text-lg hover:scale-105 transition-transform">
               S
-            </div>
+            </Link>
             <div>
               <h1 className="text-xl font-bold tracking-tight">STAS CANNON</h1>
               <p className="text-xs text-gray-500">高速STAS送金システム</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
-            <span className="text-xs text-gray-500">{connected ? '接続済み' : '未接続'}</span>
+          <div className="flex items-center gap-3">
+            <span className={`text-[10px] font-bold uppercase tracking-widest px-2.5 py-1 rounded ${config.color} text-white`}>
+              {config.label}
+            </span>
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
+              <span className="text-xs text-gray-500">{connected ? '接続済み' : '未接続'}</span>
+            </div>
           </div>
         </div>
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-8 space-y-8">
+        {/* Wallet Setup (testnet/mainnet only) */}
+        {config.needsWallet && (
+          <section className={`bg-gray-900 rounded-2xl border ${config.borderColor}/30 p-6 space-y-4`}>
+            <div className="flex items-center gap-3">
+              <div className={`w-8 h-8 rounded-full text-sm font-bold flex items-center justify-center ${wallet ? 'bg-green-500' : config.color} text-white`}>
+                {wallet ? '\u2713' : '\uD83D\uDCB3'}
+              </div>
+              <h2 className="text-lg font-semibold">ウォレット設定</h2>
+              <span className={`text-xs ${config.textColor}`}>{config.sublabel}</span>
+            </div>
+
+            {!wallet ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <button
+                    onClick={handleCreateWallet}
+                    disabled={!connected || walletLoading}
+                    className={`px-6 py-3 bg-gradient-to-r ${mode === 'bsvtestnet' ? 'from-yellow-500 to-amber-600 shadow-yellow-500/20' : 'from-red-500 to-rose-600 shadow-red-500/20'} hover:opacity-90 rounded-lg font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg`}
+                  >
+                    {walletLoading ? '作成中...' : '新規ウォレット生成'}
+                  </button>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={wifInput}
+                      onChange={(e) => setWifInput(e.target.value)}
+                      placeholder="WIF秘密鍵を入力..."
+                      className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-orange-500"
+                    />
+                    <button
+                      onClick={handleImportWallet}
+                      disabled={!connected || walletLoading || !wifInput.trim()}
+                      className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+                    >
+                      インポート
+                    </button>
+                  </div>
+                </div>
+                {walletError && (
+                  <div className="text-red-400 text-sm bg-red-950/30 border border-red-800/30 rounded-lg px-4 py-2">
+                    {walletError}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                  <div className="bg-gray-800/50 rounded-lg px-4 py-3">
+                    <span className="text-gray-500 text-xs block mb-1">アドレス</span>
+                    <span className="font-mono text-xs break-all">{wallet.address}</span>
+                  </div>
+                  <div className="bg-gray-800/50 rounded-lg px-4 py-3">
+                    <span className="text-gray-500 text-xs block mb-1">残高</span>
+                    <span className={`font-bold text-lg ${wallet.funded ? 'text-green-400' : 'text-red-400'}`}>
+                      {wallet.balanceBsv.toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}
+                    </span>
+                    <span className="text-gray-500 text-xs ml-2">({wallet.balanceSatoshis.toLocaleString()} sat)</span>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    onClick={handleCheckBalance}
+                    disabled={walletLoading}
+                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                  >
+                    {walletLoading ? '確認中...' : '残高更新'}
+                  </button>
+                  {mode === 'bsvtestnet' && (
+                    <a
+                      href="https://faucet.bitcoincloud.net/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-4 py-2 bg-yellow-600/20 border border-yellow-600/30 hover:bg-yellow-600/30 rounded-lg text-sm font-medium text-yellow-400 transition-colors"
+                    >
+                      tBSV フォーセット &rarr;
+                    </a>
+                  )}
+                  {!wallet.funded && (
+                    <p className="text-yellow-400 text-xs self-center">
+                      {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}を上記アドレスに送金してください
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
         {/* Configuration Panel */}
         <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
           <h2 className="text-lg font-semibold mb-4">設定</h2>
@@ -245,15 +437,14 @@ function App() {
                 disabled={isRunning || chargeComplete}
                 className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50"
               >
-                <option value={1000}>1,000</option>
-                <option value={10000}>10,000</option>
-                <option value={100000}>100,000</option>
-                <option value={1000000}>1,000,000</option>
+                  {config.transferOptions.map(v => (
+                    <option key={v} value={v}>{v.toLocaleString()}</option>
+                  ))}
               </select>
             </div>
             <button
               onClick={handleConfigure}
-              disabled={isRunning || !connected || chargeComplete}
+              disabled={isRunning || !connected || chargeComplete || !canProceed}
               className="px-6 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               初期化
@@ -267,6 +458,12 @@ function App() {
               </button>
             )}
           </div>
+
+          {!canProceed && config.needsWallet && (
+            <p className="mt-3 text-yellow-400 text-sm">
+              先にウォレットを設定し、{mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}をチャージしてください
+            </p>
+          )}
 
           {configured && stats.senderAddress && (
             <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
@@ -340,7 +537,9 @@ function App() {
               }`}>
                 {launchComplete ? '✓' : '2'}
               </div>
-              <h3 className="text-xl font-bold">送金時間（10s）</h3>
+              <h3 className="text-xl font-bold">
+                {mode === 'localtest' ? '送金時間（10s）' : '送金'}
+              </h3>
               {launchComplete && (
                 <span className="text-green-400 text-sm">{formatNumber(stats.txBroadcast)} 送信完了</span>
               )}
@@ -383,7 +582,7 @@ function App() {
                 disabled={!connected || isRunning}
                 className="w-full px-8 py-3 bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-400 hover:to-red-500 rounded-lg font-bold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-orange-500/20"
               >
-                🚀 送金開始（10秒間）
+                {mode === 'localtest' ? '🚀 送金開始（10秒間）' : '🚀 送金開始'}
               </button>
             )}
           </section>
@@ -461,7 +660,7 @@ function App() {
               <div className="text-left max-w-3xl mx-auto w-full space-y-3">
                 <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">トランザクション詳細</h3>
                 <p className="text-xs text-gray-500">
-                  {formatNumber(stats.txBroadcast)} 件中 {txIds.length} 件を表示 — WoC / Bitails テストネットエクスプローラーで確認
+                  {formatNumber(stats.txBroadcast)} 件中 {txIds.length} 件を表示 — {mode === 'bsvmainnet' ? 'WoC / Bitails メインネット' : 'WoC / Bitails テストネット'}エクスプローラーで確認
                 </p>
                 <div className="max-h-64 overflow-y-auto space-y-1 rounded-lg bg-gray-800/50 p-3">
                   {txIds.map((txid, i) => (
@@ -469,7 +668,7 @@ function App() {
                       <span className="text-gray-600 w-8 text-right shrink-0">#{i + 1}</span>
                       <span className="text-gray-400 truncate flex-1">{txid}</span>
                       <a
-                        href={`https://test.whatsonchain.com/tx/${txid}`}
+                        href={`${config.explorerBaseUrl}/tx/${txid}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-400 hover:text-blue-300 shrink-0 hover:underline"
@@ -477,7 +676,7 @@ function App() {
                         WoC
                       </a>
                       <a
-                        href={`https://test.bitails.io/tx/${txid}`}
+                        href={`${config.bitailsBaseUrl}/tx/${txid}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-emerald-400 hover:text-emerald-300 shrink-0 hover:underline"
@@ -505,14 +704,24 @@ function App() {
             <div className="text-8xl">🚀</div>
             <h2 className="text-3xl font-bold">STAS CANNON</h2>
             <p className="text-gray-400 max-w-md mx-auto">
-              BSV STASトークンを高速で送金するシステム。
-              秒間10万件の送金を10秒間実行し、合計100万件のトークン送金を実現します。
+              {mode === 'localtest'
+                ? 'BSV STASトークンを高速で送金するシステム。秒間10万件の送金を10秒間実行し、合計100万件のトークン送金を実現します。'
+                : mode === 'bsvtestnet'
+                ? 'BSVテストネットで実際のSTASトークンを送金します。tBSVを使用するため、実コストなしでテスト可能です。'
+                : 'BSVメインネットで実際のSTASトークンを送金します。実BSVが必要です。'}
             </p>
             <div className="flex flex-col items-center gap-2 text-sm text-gray-600">
+              {config.needsWallet && <span>0. ウォレット設定 — BSVチャージ</span>}
               <span>1. パワーチャージ — UTXO分割準備</span>
-              <span>2. 発射 — 100K TPS × 10秒</span>
+              <span>2. 発射 — {mode === 'localtest' ? '100K TPS × 10秒' : 'STAS送金実行'}</span>
               <span>3. 確認 — 送金完了確認</span>
             </div>
+            <Link
+              to="/"
+              className="inline-block px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm font-medium transition-colors text-gray-400"
+            >
+              &larr; モード選択に戻る
+            </Link>
           </section>
         )}
       </main>

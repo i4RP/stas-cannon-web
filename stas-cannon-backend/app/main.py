@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -41,6 +41,7 @@ class CannonState:
         self.receiver_address = ""
         self.running = False
         self.tx_ids: list[str] = []
+        self.mode = "localtest"
 
 
 def generate_address():
@@ -68,17 +69,24 @@ async def healthz():
 # Serve frontend static files
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 if os.path.isdir(STATIC_DIR):
+    # Serve static assets
+    assets_dir = os.path.join(STATIC_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
     @app.get("/")
+    @app.get("/localtest")
+    @app.get("/bsvtestnet")
+    @app.get("/bsvmainnet")
     async def serve_index():
         return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
-    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
-
 
 @app.websocket("/ws/cannon")
-async def websocket_cannon(websocket: WebSocket):
+async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="localtest")):
     await websocket.accept()
     st = CannonState()
+    st.mode = mode
     try:
         while True:
             data = await websocket.receive_text()
