@@ -1,0 +1,15 @@
+{
+  "name": "stas-cannon-stas-service",
+  "version": "1.0.0",
+  "description": "Node.js STAS service layer wrapping dxs-stas-sdk for STAS Cannon",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "dxs-stas-sdk": "file:../../dxs-stas-sdk",
+    "express": "^4.21.0"
+  }
+}
