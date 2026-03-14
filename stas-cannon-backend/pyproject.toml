@@ -9,6 +9,8 @@ readme = "README.md"
 python = "^3.12"
 fastapi = {extras = ["standard"], version = "^0.135.1"}
 websockets = "^14.0"
+httpx = "^0.28.1"
+ecdsa = "^0.19.1"
 
 
 [build-system]
