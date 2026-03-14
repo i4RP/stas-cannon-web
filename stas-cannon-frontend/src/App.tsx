@@ -95,7 +95,7 @@ function App({ mode }: { mode: AppMode }) {
   // Wallet state for testnet/mainnet
   const [wallet, setWallet] = useState<WalletInfo | null>(null)
   const [walletLoading, setWalletLoading] = useState(false)
-  const [wifInput, setWifInput] = useState('')
+  const [wifInput, setWifInput] = useState(mode === 'bsvtestnet' ? 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F' : '')
   const [walletError, setWalletError] = useState('')
   const [phaseError, setPhaseError] = useState('')
 
