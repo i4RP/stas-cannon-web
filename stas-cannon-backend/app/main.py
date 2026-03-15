@@ -107,6 +107,9 @@ async def background_presplit():
         }
         pool.token_scheme = token_scheme
 
+        # Wait a bit for recent TXs to propagate to WoC
+        await asyncio.sleep(5)
+
         # Get wallet UTXOs
         logger.info(f"[PRESPLIT] Scanning UTXOs for {wallet['address']}")
         raw_utxos = await woc_get_utxos(wallet["address"], mode)
@@ -124,7 +127,18 @@ async def background_presplit():
 
         for idx, candidate in enumerate(sorted_utxos):
             try:
-                tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+                # Retry WoC tx hex fetch up to 3 times (unconfirmed TXs may 404 briefly)
+                tx_hex = None
+                for retry in range(3):
+                    try:
+                        tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+                        break
+                    except Exception:
+                        if retry < 2:
+                            await asyncio.sleep(2)
+                if not tx_hex:
+                    logger.warning(f"[PRESPLIT] Skipping UTXO {candidate['tx_hash']}:{candidate['tx_pos']} (value={candidate['value']}) - TX hex not found after retries")
+                    continue
                 tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
                 output = tx_info["outputs"][candidate["tx_pos"]]
                 if output.get("scriptType") == "p2pkh":
@@ -158,7 +172,10 @@ async def background_presplit():
                 logger.warning(f"[PRESPLIT] UTXO parse error: {e}")
                 continue
 
-        logger.info(f"[PRESPLIT] Found {len(p2pkh_utxos)} P2PKH, {len(dstas_1sat_utxos)} 1-sat DSTAS, {len(dstas_large_utxos)} large DSTAS")
+        total_p2pkh_sats = sum(u["satoshis"] for u in p2pkh_utxos)
+        total_large_dstas_sats = sum(u["satoshis"] for u in dstas_large_utxos)
+        logger.info(f"[PRESPLIT] Found {len(p2pkh_utxos)} P2PKH ({total_p2pkh_sats} sats), {len(dstas_1sat_utxos)} 1-sat DSTAS, {len(dstas_large_utxos)} large DSTAS ({total_large_dstas_sats} sats)")
+        logger.info(f"[PRESPLIT] Raw UTXOs from WoC: {len(sorted_utxos)} total, parsed {len(p2pkh_utxos)+len(dstas_1sat_utxos)+len(dstas_large_utxos)} successfully")
 
         # Store existing 1-sat UTXOs in pool
         pool.stas_utxos = list(dstas_1sat_utxos)
@@ -170,15 +187,15 @@ async def background_presplit():
                 "addressHash160": address_hash160, "scriptType": "p2pkh",
             })
 
-        # If no large DSTAS and no need to mint, we're done
-        if not dstas_large_utxos and not p2pkh_utxos:
+        # If no large DSTAS and not enough P2PKH to mint, just use what we have
+        if not dstas_large_utxos and (not p2pkh_utxos or dstas_1sat_utxos):
             pool.fee_utxos = fee_pool
             pool.status = "ready"
-            logger.info(f"[PRESPLIT] Ready with {pool.available} recycled UTXOs")
+            logger.info(f"[PRESPLIT] Ready with {pool.available} recycled UTXOs, {len(fee_pool)} fee UTXOs")
             return
 
-        # If we have large DSTAS, split them
-        if dstas_large_utxos:
+        # If we have large DSTAS and fee UTXOs, split them
+        if dstas_large_utxos and fee_pool:
             source_dstas = dstas_large_utxos[0]
             new_count = source_dstas["satoshis"]
             pool.status = "splitting"
@@ -239,14 +256,28 @@ async def background_presplit():
                 if batch_num % 50 == 0:
                     logger.info(f"[PRESPLIT] Split progress: {pool.available} UTXOs, batch {batch_num}/{total_batches}")
 
-        # If we have enough P2PKH but no DSTAS, mint first
-        elif p2pkh_utxos and not dstas_1sat_utxos:
-            pool.status = "minting"
+        # If large DSTAS exists but no fee UTXOs, mark ready with what we have
+        elif dstas_large_utxos and not fee_pool:
+            pool.fee_utxos = []
+            pool.status = "ready"
+            logger.info(f"[PRESPLIT] Ready with {pool.available} UTXOs (no fee UTXOs for further splitting)")
+            return
+
+        # If we have enough P2PKH but no DSTAS at all, mint first
+        elif p2pkh_utxos and not dstas_1sat_utxos and not dstas_large_utxos:
             total_p2pkh_sats = sum(u["satoshis"] for u in p2pkh_utxos)
             MINT_AMOUNT = 10_000_000
             estimated_issue_fee = int(5000 * FEE_RATE) + 500
             min_required = MINT_AMOUNT + estimated_issue_fee
 
+            # If not enough P2PKH to mint even a small amount, just mark ready with nothing
+            if total_p2pkh_sats < 2000:
+                pool.fee_utxos = fee_pool
+                pool.status = "ready"
+                logger.info(f"[PRESPLIT] Insufficient balance ({total_p2pkh_sats} sats) to mint, ready with {pool.available} UTXOs")
+                return
+
+            pool.status = "minting"
             if total_p2pkh_sats < min_required:
                 MINT_AMOUNT = max(1000, total_p2pkh_sats - estimated_issue_fee)
 
