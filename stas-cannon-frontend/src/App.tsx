@@ -160,6 +160,7 @@ function App({ mode }: { mode: AppMode }) {
   const [wifInput, setWifInput] = useState(mode === 'bsvtestnet' ? 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F' : '')
   const [walletError, setWalletError] = useState('')
   const [phaseError, setPhaseError] = useState('')
+  const [showFaucetModal, setShowFaucetModal] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -480,14 +481,12 @@ function App({ mode }: { mode: AppMode }) {
                     {walletLoading ? '確認中...' : '残高更新'}
                   </button>
                   {mode === 'bsvtestnet' && (
-                    <a
-                      href="https://faucet.bitcoincloud.net/"
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      onClick={() => setShowFaucetModal(true)}
                       className="px-4 py-2 bg-yellow-600/20 border border-yellow-600/30 hover:bg-yellow-600/30 rounded-lg text-sm font-medium text-yellow-400 transition-colors"
                     >
                       tBSV フォーセット &rarr;
-                    </a>
+                    </button>
                   )}
                   {!wallet.funded && (
                     <p className="text-yellow-400 text-xs self-center">
@@ -849,6 +848,33 @@ function App({ mode }: { mode: AppMode }) {
           </section>
         )}
       </main>
+
+      {/* Faucet Modal */}
+      {showFaucetModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowFaucetModal(false)}>
+          <div className="bg-gray-900 border border-yellow-600/30 rounded-2xl p-6 max-w-sm w-full space-y-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-bold text-yellow-400">tBSV フォーセット</h3>
+              <button onClick={() => setShowFaucetModal(false)} className="text-gray-500 hover:text-white text-xl">&times;</button>
+            </div>
+            <p className="text-xs text-gray-400">以下のフォーセットからtBSVを取得できます</p>
+            <div className="space-y-3">
+              <a href="https://scrypt.io/faucet/" target="_blank" rel="noopener noreferrer" className="block bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl px-4 py-3 transition-colors">
+                <div className="font-semibold text-sm text-white">sCrypt Faucet</div>
+                <div className="text-xs text-gray-400 mt-0.5">scrypt.io/faucet/</div>
+              </a>
+              <a href="https://bsvfaucet.com" target="_blank" rel="noopener noreferrer" className="block bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl px-4 py-3 transition-colors">
+                <div className="font-semibold text-sm text-white">BSV Faucet</div>
+                <div className="text-xs text-gray-400 mt-0.5">bsvfaucet.com</div>
+              </a>
+              <a href="https://witnessonchain.com/faucet/tbsv" target="_blank" rel="noopener noreferrer" className="block bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl px-4 py-3 transition-colors">
+                <div className="font-semibold text-sm text-white">WitnessOnChain Faucet</div>
+                <div className="text-xs text-gray-400 mt-0.5">witnessonchain.com/faucet/tbsv</div>
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="border-t border-gray-800 mt-16">
