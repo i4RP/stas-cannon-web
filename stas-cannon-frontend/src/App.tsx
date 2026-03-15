@@ -2,6 +2,47 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import './App.css'
 
+// Cost estimation: calculate estimated sats needed for N transfers
+// Formula breakdown:
+//   - Token issuance: N tokens * (1 sat/token + ~2918 bytes * feeRate per output) + contract TX overhead
+//   - Transfer fees: N transfers * ~800 bytes * feeRate per transfer TX
+//   - Confirmation: no additional cost
+function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
+  totalSats: number;
+  breakdown: { label: string; sats: number; formula: string }[];
+} {
+  const feeRate = mode === 'bsvmainnet' ? 0.05 : 0.02
+  const batchSize = 500
+  const batches = Math.ceil(count / batchSize)
+
+  // Token issuance cost: each DSTAS output ~2918 bytes locking script
+  const issueBytesPerToken = 2918
+  const issueOverhead = 1000 // base TX overhead per batch
+  const issueSats = count * 1 // 1 sat per token
+  const issueFee = Math.ceil((count * issueBytesPerToken + batches * issueOverhead) * feeRate)
+  const contractFee = Math.ceil(batches * 300 * feeRate) // contract TX per batch
+
+  // Transfer fees: each transfer TX ~800 bytes
+  const transferBytesPerTx = 800
+  const transferFee = Math.ceil(count * transferBytesPerTx * feeRate)
+
+  // Fee split TX (for concurrent groups)
+  const splitFee = count >= 100 ? Math.ceil(500 * feeRate) : 0
+
+  const totalSats = issueSats + issueFee + contractFee + transferFee + splitFee
+
+  return {
+    totalSats,
+    breakdown: [
+      { label: 'トークン発行 (1sat x N)', sats: issueSats, formula: `${count} x 1 = ${issueSats}` },
+      { label: '発行TX手数料', sats: issueFee, formula: `${count} x ${issueBytesPerToken}B x ${feeRate} sat/B` },
+      { label: 'Contract TX手数料', sats: contractFee, formula: `${batches}batch x 300B x ${feeRate}` },
+      { label: '転送TX手数料', sats: transferFee, formula: `${count} x ${transferBytesPerTx}B x ${feeRate}` },
+      ...(splitFee > 0 ? [{ label: 'Fee分割TX', sats: splitFee, formula: `500B x ${feeRate}` }] : []),
+    ],
+  }
+}
+
 const API_URL = import.meta.env.VITE_API_URL || ''
 
 export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet'
@@ -108,8 +149,13 @@ const MODE_CONFIG = {
 
 function App({ mode }: { mode: AppMode }) {
   const config = MODE_CONFIG[mode]
+
+  // Auto-scroll to top when mode page loads (for mobile)
+  useEffect(() => {
+    window.scrollTo(0, 0)
+  }, [])
   const [phase, setPhase] = useState<Phase>('idle')
-  const [totalTransfers, setTotalTransfers] = useState(config.transferOptions[config.transferOptions.length - 1])
+  const [totalTransfers, setTotalTransfers] = useState(config.transferOptions[0])
   const [progress, setProgress] = useState<ProgressData | null>(null)
   const [stats, setStats] = useState<Stats>({
     txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
@@ -474,9 +520,30 @@ function App({ mode }: { mode: AppMode }) {
         <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
           <h2 className="text-lg font-semibold mb-4">設定</h2>
           {mode !== 'localtest' && (
-            <div className="text-xs text-gray-500 bg-gray-800/30 rounded-lg px-3 py-2 mb-3">
-              合計推定時間: {getEstimatedTimes(mode, totalTransfers).total}
-              <span className="text-gray-600 ml-1">(チャージ {getEstimatedTimes(mode, totalTransfers).charge} + 送金 {getEstimatedTimes(mode, totalTransfers).launch} + 確認 {getEstimatedTimes(mode, totalTransfers).confirm})</span>
+            <div className="space-y-2 mb-3">
+              <div className="text-xs text-gray-500 bg-gray-800/30 rounded-lg px-3 py-2">
+                合計推定時間: {getEstimatedTimes(mode, totalTransfers).total}
+                <span className="text-gray-600 ml-1">(チャージ {getEstimatedTimes(mode, totalTransfers).charge} + 送金 {getEstimatedTimes(mode, totalTransfers).launch} + 確認 {getEstimatedTimes(mode, totalTransfers).confirm})</span>
+              </div>
+              {(mode === 'bsvtestnet' || mode === 'bsvmainnet') && (() => {
+                const cost = getEstimatedCost(mode, totalTransfers)
+                return (
+                  <div className="text-xs bg-gray-800/30 rounded-lg px-3 py-2 space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="text-gray-400">推定必要量:</span>
+                      <span className="font-bold text-orange-400">{cost.totalSats.toLocaleString()} sats ({(cost.totalSats / 1e8).toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'})</span>
+                    </div>
+                    <div className="border-t border-gray-700/50 pt-1 space-y-0.5">
+                      {cost.breakdown.map((item, i) => (
+                        <div key={i} className="flex justify-between text-gray-600">
+                          <span>{item.label}</span>
+                          <span className="font-mono">{item.sats.toLocaleString()} <span className="text-gray-700">({item.formula})</span></span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
           )}
           <div className="flex flex-col sm:flex-row gap-4 items-end">
