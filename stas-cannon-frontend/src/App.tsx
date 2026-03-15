@@ -166,6 +166,7 @@ function App({ mode }: { mode: AppMode }) {
   const [walletError, setWalletError] = useState('')
   const [phaseError, setPhaseError] = useState('')
   const [showFaucetModal, setShowFaucetModal] = useState(false)
+  const [presplitStatus, setPresplitStatus] = useState<{ status: string; available: number; progress: number; total: number; error: string } | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -310,6 +311,16 @@ function App({ mode }: { mode: AppMode }) {
         case 'wallet_error':
           setWalletError(msg.message)
           setWalletLoading(false)
+          break
+
+        case 'presplit_status':
+          setPresplitStatus({
+            status: msg.status,
+            available: msg.available,
+            progress: msg.progress,
+            total: msg.total,
+            error: msg.error,
+          })
           break
 
         case 'error':
@@ -648,9 +659,26 @@ function App({ mode }: { mode: AppMode }) {
 
             {!chargeComplete && phase !== 'power_charge' && (
               <>
+                {mode === 'bsvtestnet' && presplitStatus && (
+                  <div className={`text-xs rounded-lg px-3 py-2 ${
+                    presplitStatus.status === 'ready' ? 'bg-green-900/30 border border-green-700/30 text-green-400' :
+                    presplitStatus.status === 'error' ? 'bg-red-900/30 border border-red-700/30 text-red-400' :
+                    'bg-blue-900/30 border border-blue-700/30 text-blue-400'
+                  }`}>
+                    {presplitStatus.status === 'ready' && (
+                      <span>事前分割済み: {presplitStatus.available.toLocaleString()} UTXOs 利用可能 (即時チャージ)</span>
+                    )}
+                    {presplitStatus.status === 'splitting' && (
+                      <span>バックグラウンド分割中... {presplitStatus.progress.toLocaleString()} / {presplitStatus.total.toLocaleString()}</span>
+                    )}
+                    {presplitStatus.status === 'scanning' && <span>UTXO スキャン中...</span>}
+                    {presplitStatus.status === 'minting' && <span>トークン発行中...</span>}
+                    {presplitStatus.status === 'error' && <span>事前分割エラー: {presplitStatus.error}</span>}
+                  </div>
+                )}
                 <div className="text-xs text-gray-500 bg-gray-800/50 rounded-lg px-3 py-2">
-                  推定所要時間: {getEstimatedTimes(mode, totalTransfers).charge}
-                  <span className="text-gray-600 ml-2">(トークン発行 + UTXO分割)</span>
+                  推定所要時間: {mode === 'bsvtestnet' && presplitStatus?.status === 'ready' && presplitStatus.available >= totalTransfers ? '約1秒 (事前分割済み)' : getEstimatedTimes(mode, totalTransfers).charge}
+                  <span className="text-gray-600 ml-2">{mode === 'bsvtestnet' && presplitStatus?.status === 'ready' && presplitStatus.available >= totalTransfers ? '(プールから即時取得)' : '(トークン発行 + UTXO分割)'}</span>
                 </div>
                 <button
                   onClick={handleCharge}

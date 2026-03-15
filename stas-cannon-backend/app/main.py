@@ -2,15 +2,394 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 import asyncio
 import os
 import secrets
 import time
 import json
 import hashlib
+import logging
 import httpx
 
-app = FastAPI()
+logger = logging.getLogger("stas_cannon")
+
+# Fixed testnet wallet WIF for background UTXO splitting (loaded from env)
+TESTNET_WIF = os.environ.get("TESTNET_WIF", "")
+
+
+class PreSplitPool:
+    """Global pool of pre-split 1-sat DSTAS UTXOs ready for transfer.
+    
+    The backend automatically splits tokens in the background so that
+    when a user starts a test, the charge phase is nearly instant.
+    """
+    def __init__(self):
+        self.stas_utxos: list[dict] = []  # Available 1-sat DSTAS UTXOs
+        self.fee_utxos: list[dict] = []   # Available fee UTXOs
+        self.token_scheme: dict | None = None
+        self.wallet: dict | None = None
+        self.status: str = "idle"  # idle, scanning, minting, splitting, ready, error
+        self.progress: int = 0
+        self.total: int = 0
+        self.error: str = ""
+        self.lock = asyncio.Lock()
+        self._task: asyncio.Task | None = None
+
+    @property
+    def available(self) -> int:
+        return len(self.stas_utxos)
+
+    def take(self, count: int) -> tuple[list[dict], list[dict]]:
+        """Take up to `count` pre-split UTXOs and associated fee UTXOs from the pool."""
+        taken_stas = self.stas_utxos[:count]
+        self.stas_utxos = self.stas_utxos[count:]
+        taken_fees = list(self.fee_utxos)
+        self.fee_utxos = []
+        return taken_stas, taken_fees
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "available": self.available,
+            "progress": self.progress,
+            "total": self.total,
+            "error": self.error,
+        }
+
+
+# Global pre-split pool instance
+pre_split_pool = PreSplitPool()
+
+
+async def background_presplit():
+    """Background task: pre-split DSTAS tokens for testnet using fixed wallet."""
+    pool = pre_split_pool
+    try:
+        if not TESTNET_WIF:
+            pool.status = "idle"
+            logger.info("[PRESPLIT] No TESTNET_WIF configured, skipping pre-split")
+            return
+
+        # Wait for STAS service to be ready
+        pool.status = "scanning"
+        for attempt in range(30):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(f"{STAS_SERVICE_URL}/healthz")
+                    if resp.status_code == 200:
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        else:
+            pool.status = "error"
+            pool.error = "STAS service not reachable"
+            logger.error("[PRESPLIT] STAS service not reachable after 60s")
+            return
+
+        # Import testnet wallet
+        wallet = import_bsv_wallet(TESTNET_WIF)
+        pool.wallet = wallet
+        mode = "bsvtestnet"
+        privkey_hex = wallet["privkey_bytes"].hex()
+        address_hash160 = wallet["hash160"].hex()
+        FEE_RATE = 0.02
+
+        token_scheme = {
+            "name": "STAS",
+            "tokenId": address_hash160,
+            "symbol": "STAS",
+            "satoshisPerToken": 1,
+            "freeze": False,
+            "confiscation": False,
+            "isDivisible": True,
+        }
+        pool.token_scheme = token_scheme
+
+        # Get wallet UTXOs
+        logger.info(f"[PRESPLIT] Scanning UTXOs for {wallet['address']}")
+        raw_utxos = await woc_get_utxos(wallet["address"], mode)
+        if not raw_utxos:
+            pool.status = "error"
+            pool.error = "UTXOがありません。tBSVを送金してください。"
+            logger.warning("[PRESPLIT] No UTXOs found")
+            return
+
+        # Parse UTXOs
+        sorted_utxos = sorted(raw_utxos, key=lambda u: u.get("value", 0), reverse=True)
+        p2pkh_utxos: list[dict] = []
+        dstas_1sat_utxos: list[dict] = []
+        dstas_large_utxos: list[dict] = []
+
+        for idx, candidate in enumerate(sorted_utxos):
+            try:
+                tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+                tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
+                output = tx_info["outputs"][candidate["tx_pos"]]
+                if output.get("scriptType") == "p2pkh":
+                    p2pkh_utxos.append({
+                        "raw": candidate,
+                        "txid": candidate["tx_hash"],
+                        "vout": candidate["tx_pos"],
+                        "satoshis": candidate["value"],
+                        "locking_script": output["lockingScriptHex"],
+                    })
+                elif output.get("scriptType") == "dstas":
+                    if candidate["value"] == 1:
+                        dstas_1sat_utxos.append({
+                            "txId": candidate["tx_hash"],
+                            "vout": candidate["tx_pos"],
+                            "satoshis": 1,
+                            "lockingScriptHex": output["lockingScriptHex"],
+                            "addressHash160": output.get("addressHash160", address_hash160),
+                            "scriptType": "dstas",
+                        })
+                    elif candidate["value"] > 1:
+                        dstas_large_utxos.append({
+                            "txId": candidate["tx_hash"],
+                            "vout": candidate["tx_pos"],
+                            "satoshis": candidate["value"],
+                            "lockingScriptHex": output["lockingScriptHex"],
+                            "addressHash160": output.get("addressHash160", address_hash160),
+                            "scriptType": "dstas",
+                        })
+            except Exception as e:
+                logger.warning(f"[PRESPLIT] UTXO parse error: {e}")
+                continue
+
+        logger.info(f"[PRESPLIT] Found {len(p2pkh_utxos)} P2PKH, {len(dstas_1sat_utxos)} 1-sat DSTAS, {len(dstas_large_utxos)} large DSTAS")
+
+        # Store existing 1-sat UTXOs in pool
+        pool.stas_utxos = list(dstas_1sat_utxos)
+        fee_pool: list[dict] = []
+        for u in p2pkh_utxos:
+            fee_pool.append({
+                "txId": u["txid"], "vout": u["vout"], "satoshis": u["satoshis"],
+                "lockingScriptHex": u["locking_script"],
+                "addressHash160": address_hash160, "scriptType": "p2pkh",
+            })
+
+        # If no large DSTAS and no need to mint, we're done
+        if not dstas_large_utxos and not p2pkh_utxos:
+            pool.fee_utxos = fee_pool
+            pool.status = "ready"
+            logger.info(f"[PRESPLIT] Ready with {pool.available} recycled UTXOs")
+            return
+
+        # If we have large DSTAS, split them
+        if dstas_large_utxos:
+            source_dstas = dstas_large_utxos[0]
+            new_count = source_dstas["satoshis"]
+            pool.status = "splitting"
+            pool.total = new_count
+            pool.progress = 0
+
+            MAX_SPLIT_BATCH = 3
+            cur = source_dstas
+            remaining = new_count
+            batch_num = 0
+            total_batches = (new_count + MAX_SPLIT_BATCH - 1) // MAX_SPLIT_BATCH
+
+            while remaining > 0 and cur and fee_pool:
+                batch = min(remaining, MAX_SPLIT_BATCH)
+                batch_num += 1
+
+                dests = [{"satoshis": 1, "toHash160": address_hash160} for _ in range(batch)]
+                change_sats = cur["satoshis"] - batch
+                if change_sats > 0:
+                    dests.append({"satoshis": change_sats, "toHash160": address_hash160})
+
+                fee_utxo = fee_pool.pop(0)
+
+                try:
+                    result = await stas_service_call("/split", {
+                        "privkeyHex": privkey_hex, "stasUtxo": cur, "feeUtxo": fee_utxo,
+                        "destinations": dests, "scheme": token_scheme, "feeRate": FEE_RATE,
+                    })
+                    await woc_broadcast_tx(result["txHex"], mode)
+                except Exception as e:
+                    logger.error(f"[PRESPLIT] Split batch {batch_num} failed: {e}")
+                    if fee_utxo:
+                        fee_pool.insert(0, fee_utxo)
+                    break
+
+                cur = None
+                for out in result["outputs"]:
+                    if out["scriptType"] == "dstas" and out["satoshis"] == 1:
+                        pool.stas_utxos.append({
+                            "txId": result["txId"], "vout": out["vout"], "satoshis": 1,
+                            "lockingScriptHex": out["lockingScriptHex"],
+                            "addressHash160": out.get("addressHash160", address_hash160),
+                            "scriptType": "dstas",
+                        })
+                    elif out["scriptType"] == "dstas" and out["satoshis"] > 1:
+                        cur = {"txId": result["txId"], "vout": out["vout"], "satoshis": out["satoshis"],
+                               "lockingScriptHex": out["lockingScriptHex"],
+                               "addressHash160": out.get("addressHash160", address_hash160),
+                               "scriptType": "dstas"}
+                    elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                        fee_pool.insert(0, {"txId": result["txId"], "vout": out["vout"], "satoshis": out["satoshis"],
+                                           "lockingScriptHex": out["lockingScriptHex"],
+                                           "addressHash160": address_hash160, "scriptType": "p2pkh"})
+
+                remaining -= batch
+                pool.progress = pool.available
+
+                if batch_num % 50 == 0:
+                    logger.info(f"[PRESPLIT] Split progress: {pool.available} UTXOs, batch {batch_num}/{total_batches}")
+
+        # If we have enough P2PKH but no DSTAS, mint first
+        elif p2pkh_utxos and not dstas_1sat_utxos:
+            pool.status = "minting"
+            total_p2pkh_sats = sum(u["satoshis"] for u in p2pkh_utxos)
+            MINT_AMOUNT = 10_000_000
+            estimated_issue_fee = int(5000 * FEE_RATE) + 500
+            min_required = MINT_AMOUNT + estimated_issue_fee
+
+            if total_p2pkh_sats < min_required:
+                MINT_AMOUNT = max(1000, total_p2pkh_sats - estimated_issue_fee)
+
+            funding = p2pkh_utxos[0]
+            funding_txid = funding["txid"]
+            funding_vout = funding["vout"]
+            funding_satoshis = funding["satoshis"]
+            funding_locking_script = funding["locking_script"]
+
+            # Consolidate if needed
+            if funding_satoshis < min_required and len(p2pkh_utxos) > 1:
+                try:
+                    consolidate_inputs = [
+                        build_utxo_info(u["txid"], u["vout"], u["satoshis"], u["locking_script"], address_hash160)
+                        for u in p2pkh_utxos
+                    ]
+                    consolidate_result = await stas_service_call("/consolidate", {
+                        "privkeyHex": privkey_hex, "utxos": consolidate_inputs, "feeRate": FEE_RATE,
+                    })
+                    await woc_broadcast_tx(consolidate_result["txHex"], mode)
+                    consolidated_output = consolidate_result["outputs"][0]
+                    funding_txid = consolidate_result["txId"]
+                    funding_vout = 0
+                    funding_satoshis = consolidated_output["satoshis"]
+                    funding_locking_script = consolidated_output["lockingScriptHex"]
+                    fee_pool = []
+                except Exception as e:
+                    pool.status = "error"
+                    pool.error = f"UTXO統合失敗: {e}"
+                    return
+
+            try:
+                logger.info(f"[PRESPLIT] Minting {MINT_AMOUNT:,} tokens")
+                issue_result = await stas_service_call("/issue", {
+                    "privkeyHex": privkey_hex,
+                    "fundingUtxo": build_utxo_info(funding_txid, funding_vout, funding_satoshis, funding_locking_script, address_hash160),
+                    "scheme": token_scheme,
+                    "destinations": [{"satoshis": MINT_AMOUNT, "toHash160": address_hash160}],
+                    "feeRate": FEE_RATE,
+                })
+                contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+                issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
+                logger.info(f"[PRESPLIT] Minted: contract={contract_txid}, issue={issue_txid}")
+
+                # Find DSTAS output and start splitting
+                source_dstas = None
+                fee_pool = []
+                for out in issue_result["issueOutputs"]:
+                    if out["scriptType"] == "dstas":
+                        source_dstas = {
+                            "txId": issue_txid, "vout": out["vout"], "satoshis": out["satoshis"],
+                            "lockingScriptHex": out["lockingScriptHex"],
+                            "addressHash160": out.get("addressHash160", address_hash160),
+                            "scriptType": "dstas",
+                        }
+                    elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                        fee_pool = [{
+                            "txId": issue_txid, "vout": out["vout"], "satoshis": out["satoshis"],
+                            "lockingScriptHex": out["lockingScriptHex"],
+                            "addressHash160": address_hash160, "scriptType": "p2pkh",
+                        }]
+
+                if source_dstas and fee_pool:
+                    pool.status = "splitting"
+                    pool.total = source_dstas["satoshis"]
+                    MAX_SPLIT_BATCH = 3
+                    cur = source_dstas
+                    remaining = source_dstas["satoshis"]
+                    batch_num = 0
+
+                    while remaining > 0 and cur and fee_pool:
+                        batch = min(remaining, MAX_SPLIT_BATCH)
+                        batch_num += 1
+
+                        dests = [{"satoshis": 1, "toHash160": address_hash160} for _ in range(batch)]
+                        change_sats = cur["satoshis"] - batch
+                        if change_sats > 0:
+                            dests.append({"satoshis": change_sats, "toHash160": address_hash160})
+
+                        fee_utxo = fee_pool.pop(0)
+                        try:
+                            result = await stas_service_call("/split", {
+                                "privkeyHex": privkey_hex, "stasUtxo": cur, "feeUtxo": fee_utxo,
+                                "destinations": dests, "scheme": token_scheme, "feeRate": FEE_RATE,
+                            })
+                            await woc_broadcast_tx(result["txHex"], mode)
+                        except Exception as e:
+                            logger.error(f"[PRESPLIT] Split failed: {e}")
+                            break
+
+                        cur = None
+                        for out in result["outputs"]:
+                            if out["scriptType"] == "dstas" and out["satoshis"] == 1:
+                                pool.stas_utxos.append({
+                                    "txId": result["txId"], "vout": out["vout"], "satoshis": 1,
+                                    "lockingScriptHex": out["lockingScriptHex"],
+                                    "addressHash160": out.get("addressHash160", address_hash160),
+                                    "scriptType": "dstas",
+                                })
+                            elif out["scriptType"] == "dstas" and out["satoshis"] > 1:
+                                cur = {"txId": result["txId"], "vout": out["vout"], "satoshis": out["satoshis"],
+                                       "lockingScriptHex": out["lockingScriptHex"],
+                                       "addressHash160": out.get("addressHash160", address_hash160),
+                                       "scriptType": "dstas"}
+                            elif out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
+                                fee_pool.insert(0, {"txId": result["txId"], "vout": out["vout"], "satoshis": out["satoshis"],
+                                                   "lockingScriptHex": out["lockingScriptHex"],
+                                                   "addressHash160": address_hash160, "scriptType": "p2pkh"})
+
+                        remaining -= batch
+                        pool.progress = pool.available
+
+                        if batch_num % 50 == 0:
+                            logger.info(f"[PRESPLIT] Split progress: {pool.available} UTXOs")
+
+            except Exception as e:
+                pool.status = "error"
+                pool.error = f"Mint失敗: {e}"
+                logger.error(f"[PRESPLIT] Mint failed: {e}")
+                return
+
+        pool.fee_utxos = fee_pool
+        pool.status = "ready"
+        logger.info(f"[PRESPLIT] Complete: {pool.available} DSTAS UTXOs, {len(fee_pool)} fee UTXOs ({sum(u['satoshis'] for u in fee_pool)} sats)")
+
+    except Exception as e:
+        pool.status = "error"
+        pool.error = str(e)
+        logger.error(f"[PRESPLIT] Unexpected error: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: launch background pre-split task
+    pre_split_pool._task = asyncio.create_task(background_presplit())
+    logger.info("[STARTUP] Background pre-split task started")
+    yield
+    # Shutdown: cancel task
+    if pre_split_pool._task:
+        pre_split_pool._task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
@@ -385,6 +764,12 @@ async def healthz():
     return {"status": "ok"}
 
 
+@app.get("/api/presplit-status")
+async def presplit_status():
+    """Get the status of the background pre-split pool."""
+    return pre_split_pool.to_dict()
+
+
 # Serve frontend static files
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 if os.path.isdir(STATIC_DIR):
@@ -450,6 +835,12 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                         "balance_satoshis": balance["balance_satoshis"],
                         "funded": balance["funded"],
                     })
+                    # Send pre-split pool status for testnet
+                    if mode == "bsvtestnet" and wif == TESTNET_WIF:
+                        await websocket.send_json({
+                            "type": "presplit_status",
+                            **pre_split_pool.to_dict(),
+                        })
                 except Exception as e:
                     await websocket.send_json({"type": "wallet_error", "message": str(e)})
 
@@ -731,6 +1122,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     """Real Phase 1: Prepare STAS tokens for transfer.
 
     Strategy:
+    0. Check pre-split pool first (instant if available)
     1. Check for existing recyclable 1-sat DSTAS UTXOs (instant recycling)
     2. If large DSTAS UTXOs exist, split them into 1-sat UTXOs using parallel chains
     3. If no DSTAS, mint tokens in a SINGLE issue TX, then parallel split
@@ -750,6 +1142,29 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     address_hash160 = wallet["hash160"].hex()
 
     await ws.send_json({"type": "phase", "phase": "power_charge", "total": total})
+
+    # === Step 0: Check pre-split pool (testnet only, same wallet) ===
+    if mode == "bsvtestnet" and wallet.get("wif") == TESTNET_WIF and pre_split_pool.status == "ready" and pre_split_pool.available >= total:
+        await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 5,
+                           "status": f"\u4e8b\u524d\u5206\u5272\u30d7\u30fc\u30eb\u304b\u3089\u53d6\u5f97\u4e2d... ({pre_split_pool.available}\u500b\u5229\u7528\u53ef\u80fd)"})
+        taken_stas, taken_fees = pre_split_pool.take(total)
+        if len(taken_stas) >= total:
+            st.stas_utxos = taken_stas[:total]
+            st.fee_utxos = taken_fees
+            st.utxos_prepared = total
+            st.token_scheme = pre_split_pool.token_scheme
+            st.issue_txid = "presplit"
+            st.receiver_address = wallet["address"]
+            st.receiver_hash160 = address_hash160
+            total_fee_sats = sum(u["satoshis"] for u in taken_fees)
+            logger.info(f"[CHARGE] Used pre-split pool: {total} UTXOs, {len(taken_fees)} fee UTXOs ({total_fee_sats} sats)")
+            await ws.send_json({
+                "type": "phase_complete", "phase": "power_charge",
+                "utxos_prepared": total, "issue_txid": "presplit",
+                "recycled": True, "fee_budget": total_fee_sats,
+            })
+            return
+
     await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 0, "status": "UTXO\u3092\u53d6\u5f97\u4e2d..."})
 
     # Step 1: Get wallet UTXOs
