@@ -1665,11 +1665,11 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                 return
 
             # Reserve extra outputs for transfer phase fees
-            # Allocate ~40% to workers (splitting) and ~60% to transfers
-            # Each split creates 3 tokens at ~750 sats fee; each transfer costs ~326 sats
+            # Optimal allocation: ~43% to workers (splitting), ~57% to transfers
+            # Each split creates 3 tokens at ~750 sats; each transfer costs ~330 sats
+            # For equal-size outputs: reserve_count / total = 0.57 → reserve ≈ workers * 1.3
             total_fee_sats = sum(u["satoshis"] for u in fee_pool)
-            # Use fewer reserve outputs but each gets more sats
-            num_reserve_outputs = max(1, min(actual_workers, 3))  # 1-3 reserve outputs
+            num_reserve_outputs = max(1, round(actual_workers * 1.3))
             total_fee_outputs = actual_workers + num_reserve_outputs
             print(f"[CHARGE] Fee pool: {total_fee_sats} sats, splitting into {actual_workers} worker + {num_reserve_outputs} reserve outputs")
 
