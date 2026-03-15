@@ -349,16 +349,15 @@ class CannonState:
         self.receiver_hash160: str = ""
 
 
-def generate_address():
-    """Generate a simulated BSV address."""
+def generate_address(mode: str = "localtest"):
+    """Generate a simulated BSV address with correct network prefix."""
     raw = secrets.token_bytes(20)
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    addr = "1"
-    num = int.from_bytes(raw, "big")
-    while num > 0:
-        num, rem = divmod(num, 58)
-        addr += alphabet[rem]
-    return addr[:34]
+    # Use proper version byte for each network
+    if mode in ("bsvtestnet",):
+        version = 0x6f  # testnet: m or n prefix
+    else:
+        version = 0x00  # mainnet: 1 prefix
+    return _base58check_encode(version, raw)
 
 
 def generate_txid():
@@ -468,8 +467,13 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                 st.wallet = prev_wallet
                 st.mode = prev_mode
                 st.total_transfers = total
-                st.sender_address = st.wallet["address"] if st.wallet else generate_address()
-                st.receiver_address = generate_address()
+                st.sender_address = st.wallet["address"] if st.wallet else generate_address(mode)
+                # For real modes, receiver = sender (self-transfer for token recycling)
+                # For localtest, generate a random receiver
+                if mode in ("bsvtestnet", "bsvmainnet") and st.wallet:
+                    st.receiver_address = st.wallet["address"]
+                else:
+                    st.receiver_address = generate_address(mode)
                 await websocket.send_json({
                     "type": "configured",
                     "total_transfers": st.total_transfers,
@@ -717,12 +721,11 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     3. Lower fee rate: 0.05 sat/byte instead of 0.1 (BSV accepts this)
     4. Self-transfer: Send to own wallet so tokens can be reused next time
     """
-    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02  # mainnet: safe rate, testnet: aggressive
-
     st.phase = "power_charge"
     total = st.total_transfers
     mode = st.mode
     wallet = st.wallet
+    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02  # mainnet: safe rate, testnet: aggressive
 
     if not wallet:
         await ws.send_json({"type": "error", "message": "ウォレットが設定されていません"})
