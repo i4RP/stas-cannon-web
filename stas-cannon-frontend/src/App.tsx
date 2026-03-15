@@ -79,9 +79,12 @@ function getEstimatedTimes(mode: AppMode, count: number): { charge: string; laun
     }
   }
   // Real blockchain modes: per-TX overhead varies by concurrency
-  // With 10 concurrent groups, throughput is ~10x single-chain
+  if (count <= 0) return { charge: '約0秒', launch: '約0秒', confirm: '約0秒', total: '約0秒' }
   const concurrency = count >= 1000 ? 10 : 1
-  const chargeSec = Math.ceil(15 + (count / Math.min(count, 500)) * 3) // batched issuance
+  // Single mint + parallel split: ~0.2s per split batch of 3, divided by workers
+  const workers = Math.min(10, Math.max(1, Math.floor(count / 100)))
+  const splitBatches = Math.ceil(count / 3)
+  const chargeSec = Math.ceil(5 + (splitBatches * 0.2) / workers) // parallel split chains
   const launchSec = Math.ceil(3 + (count * 0.5) / concurrency) // parallel transfer groups
   const confirmSec = Math.ceil(5 + (count * 0.3) / concurrency)
   const totalSec = chargeSec + launchSec + confirmSec
