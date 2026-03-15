@@ -162,7 +162,10 @@ function App({ mode }: { mode: AppMode }) {
   // Wallet state for testnet/mainnet
   const [wallet, setWallet] = useState<WalletInfo | null>(null)
   const [walletLoading, setWalletLoading] = useState(false)
-  const [wifInput, setWifInput] = useState(mode === 'bsvtestnet' ? 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F' : '')
+  const [wifInput, setWifInput] = useState(
+    mode === 'bsvtestnet' ? 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F' :
+    mode === 'bsvmainnet' ? 'KyQ8GfyiRc5fXsCqa9jHsSCV1pyHqGD7Wb2xRNDKmrCYroMP4xby' : ''
+  )
   const [walletError, setWalletError] = useState('')
   const [phaseError, setPhaseError] = useState('')
   const [showFaucetModal, setShowFaucetModal] = useState(false)
@@ -189,10 +192,14 @@ function App({ mode }: { mode: AppMode }) {
 
     ws.onopen = () => {
       setConnected(true)
-      // Auto-import wallet if WIF is pre-filled (testnet default)
-      if (mode === 'bsvtestnet') {
-        const defaultWif = 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F'
-        ws.send(JSON.stringify({ action: 'import_wallet', wif: defaultWif }))
+      // Auto-import wallet with pre-configured default WIF
+      const defaultWifs: Record<string, string> = {
+        bsvtestnet: 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F',
+        bsvmainnet: 'KyQ8GfyiRc5fXsCqa9jHsSCV1pyHqGD7Wb2xRNDKmrCYroMP4xby',
+      }
+      const wif = defaultWifs[mode]
+      if (wif) {
+        ws.send(JSON.stringify({ action: 'import_wallet', wif }))
       }
     }
 
