@@ -970,7 +970,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
         # Split the large DSTAS source into individual 1-sat UTXOs
         # Uses parallel chains for large counts (>= 100)
         # =================================================================
-        MAX_SPLIT_BATCH = 3  # SDK limit: max 4 DSTAS outputs per split TX
+        MAX_SPLIT_BATCH = 3  # DSTAS script enforces max 4 DSTAS outputs per split TX (3 + 1 change)
 
         if not fee_pool:
             await ws.send_json({"type": "error", "message": "Fee UTXO\u304c\u4e0d\u8db3\u3057\u3066\u3044\u307e\u3059"})
