@@ -95,6 +95,9 @@ function getEstimatedTimes(mode: AppMode, count: number): { charge: string; laun
   return { charge: fmt(chargeSec), launch: fmt(launchSec), confirm: fmt(confirmSec), total: fmt(totalSec) }
 }
 
+const TPS_OPTIONS = [10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000]
+const DURATION_OPTIONS = [1, 2, 5, 10]
+
 const MODE_CONFIG = {
   localtest: {
     label: 'Local Test',
@@ -102,7 +105,6 @@ const MODE_CONFIG = {
     color: 'bg-gray-600',
     textColor: 'text-gray-300',
     borderColor: 'border-gray-600',
-    transferOptions: [1000, 10000, 100000, 1000000],
     needsWallet: false,
     explorerBaseUrl: 'https://test.whatsonchain.com',
     bitailsBaseUrl: 'https://test.bitails.io',
@@ -113,7 +115,6 @@ const MODE_CONFIG = {
     color: 'bg-yellow-600',
     textColor: 'text-yellow-300',
     borderColor: 'border-yellow-600',
-    transferOptions: [10, 100, 1000, 10000],
     needsWallet: true,
     explorerBaseUrl: 'https://test.whatsonchain.com',
     bitailsBaseUrl: 'https://test.bitails.io',
@@ -124,7 +125,6 @@ const MODE_CONFIG = {
     color: 'bg-red-600',
     textColor: 'text-red-300',
     borderColor: 'border-red-600',
-    transferOptions: [10, 100, 1000, 10000, 100000, 1000000],
     needsWallet: true,
     explorerBaseUrl: 'https://whatsonchain.com',
     bitailsBaseUrl: 'https://bitails.io',
@@ -139,7 +139,9 @@ function App({ mode }: { mode: AppMode }) {
     window.scrollTo(0, 0)
   }, [])
   const [phase, setPhase] = useState<Phase>('idle')
-  const [totalTransfers, setTotalTransfers] = useState(config.transferOptions[0])
+  const [tps, setTps] = useState(TPS_OPTIONS[0])
+  const [duration, setDuration] = useState(DURATION_OPTIONS[0])
+  const totalTransfers = tps * duration
   const [progress, setProgress] = useState<ProgressData | null>(null)
   const [stats, setStats] = useState<Stats>({
     txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
@@ -530,35 +532,52 @@ function App({ mode }: { mode: AppMode }) {
               })()}
             </div>
           )}
-          <div className="flex flex-col sm:flex-row gap-4 items-end">
-            <div className="flex-1">
-              <label className="block text-sm text-gray-400 mb-1">送金件数</label>
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm text-gray-300">
+              <span>秒間</span>
               <select
-                value={totalTransfers}
-                onChange={(e) => setTotalTransfers(Number(e.target.value))}
+                value={tps}
+                onChange={(e) => setTps(Number(e.target.value))}
                 disabled={isRunning || chargeComplete}
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50"
+                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50 font-bold"
               >
-                  {config.transferOptions.map(v => (
-                    <option key={v} value={v}>{v.toLocaleString()}</option>
-                  ))}
+                {TPS_OPTIONS.map(v => (
+                  <option key={v} value={v}>{v.toLocaleString()}件</option>
+                ))}
               </select>
-            </div>
-            <button
-              onClick={handleConfigure}
-              disabled={isRunning || !connected || chargeComplete || !canProceed}
-              className="px-6 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              初期化
-            </button>
-            {isRunning && (
-              <button
-                onClick={handleStop}
-                className="px-8 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors"
+              <span>を</span>
+              <select
+                value={duration}
+                onChange={(e) => setDuration(Number(e.target.value))}
+                disabled={isRunning || chargeComplete}
+                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50 font-bold"
               >
-                停止
+                {DURATION_OPTIONS.map(v => (
+                  <option key={v} value={v}>{v}秒間</option>
+                ))}
+              </select>
+              <span>テスト</span>
+            </div>
+            <div className="text-xs text-gray-500">
+              合計: <span className="text-white font-bold">{totalTransfers.toLocaleString()}件</span>の送金
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={handleConfigure}
+                disabled={isRunning || !connected || chargeComplete || !canProceed}
+                className="px-6 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                初期化
               </button>
-            )}
+              {isRunning && (
+                <button
+                  onClick={handleStop}
+                  className="px-8 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors"
+                >
+                  停止
+                </button>
+              )}
+            </div>
           </div>
 
           {!canProceed && config.needsWallet && (
