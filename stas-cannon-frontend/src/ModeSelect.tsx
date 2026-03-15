@@ -53,7 +53,7 @@ function ModeSelect() {
             S
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">STAS CANNON</h1>
+            <h1 className="text-xl font-bold tracking-tight">STAS CANON</h1>
             <p className="text-xs text-gray-500">高速STAS送金システム</p>
           </div>
         </div>
@@ -120,7 +120,7 @@ function ModeSelect() {
 
       <footer className="border-t border-gray-800 mt-16">
         <div className="max-w-6xl mx-auto px-6 py-4 text-center text-xs text-gray-600">
-          STAS Cannon — High-Throughput BSV STAS Token Transfer System
+          STAS CANON — High-Throughput BSV STAS Token Transfer System ©2025-2026 BitcoinPay, Inc.
         </div>
       </footer>
     </div>

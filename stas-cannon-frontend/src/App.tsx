@@ -2,44 +2,27 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import './App.css'
 
-// Cost estimation: calculate estimated sats needed for N transfers
-// Token: "STAS" (integer, non-divisible), reused across runs via mint
-// Initial run: issuance + transfer fees. Recurring: transfer fees only (tokens recycled)
+// Cost estimation: transfer fees only (STAS tokens are reused via mint across all runs)
 function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
-  initialSats: number;
-  recurringSats: number;
-  breakdown: { label: string; initial: number; recurring: number; formula: string }[];
+  totalSats: number;
+  breakdown: { label: string; sats: number; formula: string }[];
 } {
   const feeRate = mode === 'bsvmainnet' ? 0.05 : 0.02
-  const batchSize = 500
-  const batches = Math.ceil(count / batchSize)
 
-  // Token issuance/mint cost (initial only): each STAS output ~2918 bytes
-  const issueBytesPerToken = 2918
-  const issueOverhead = 1000
-  const issueSats = count * 1
-  const issueFee = Math.ceil((count * issueBytesPerToken + batches * issueOverhead) * feeRate)
-  const contractFee = Math.ceil(batches * 300 * feeRate)
-
-  // Transfer fees (every run)
+  // Transfer fees (every run - tokens already exist via mint)
   const transferBytesPerTx = 800
   const transferFee = Math.ceil(count * transferBytesPerTx * feeRate)
 
-  // Fee split TX (for concurrent groups, every run)
+  // Fee split TX (for concurrent groups)
   const splitFee = count >= 100 ? Math.ceil(500 * feeRate) : 0
 
-  const initialSats = issueSats + issueFee + contractFee + transferFee + splitFee
-  const recurringSats = transferFee + splitFee
+  const totalSats = transferFee + splitFee
 
   return {
-    initialSats,
-    recurringSats,
+    totalSats,
     breakdown: [
-      { label: 'STASトークン発行/mint (1sat x N)', initial: issueSats, recurring: 0, formula: `${count} x 1` },
-      { label: '発行/mint TX手数料', initial: issueFee, recurring: 0, formula: `${count} x ${issueBytesPerToken}B x ${feeRate}` },
-      { label: 'Contract TX', initial: contractFee, recurring: 0, formula: `${batches}batch x 300B x ${feeRate}` },
-      { label: '転送TX手数料', initial: transferFee, recurring: transferFee, formula: `${count} x ${transferBytesPerTx}B x ${feeRate}` },
-      ...(splitFee > 0 ? [{ label: 'Fee分割TX', initial: splitFee, recurring: splitFee, formula: `500B x ${feeRate}` }] : []),
+      { label: '転送TX手数料', sats: transferFee, formula: `${count} x ${transferBytesPerTx}B x ${feeRate}` },
+      ...(splitFee > 0 ? [{ label: 'Fee分割TX', sats: splitFee, formula: `500B x ${feeRate}` }] : []),
     ],
   }
 }
@@ -411,7 +394,7 @@ function App({ mode }: { mode: AppMode }) {
               S
             </Link>
             <div>
-              <h1 className="text-xl font-bold tracking-tight">STAS CANNON</h1>
+              <h1 className="text-xl font-bold tracking-tight">STAS CANON</h1>
               <p className="text-xs text-gray-500">高速STAS送金システム</p>
             </div>
           </div>
@@ -531,26 +514,18 @@ function App({ mode }: { mode: AppMode }) {
                 return (
                   <div className="text-xs bg-gray-800/30 rounded-lg px-3 py-2 space-y-1">
                     <div className="flex justify-between items-center">
-                      <span className="text-gray-400">初回推定:</span>
-                      <span className="font-bold text-orange-400">{cost.initialSats.toLocaleString()} sats</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">2回目以降 (トークン再利用):</span>
-                      <span className="font-bold text-green-400">{cost.recurringSats.toLocaleString()} sats</span>
+                      <span className="text-gray-400">推定必要量:</span>
+                      <span className="font-bold text-green-400">{cost.totalSats.toLocaleString()} sats ({(cost.totalSats / 1e8).toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'})</span>
                     </div>
                     <div className="border-t border-gray-700/50 pt-1 space-y-0.5">
-                      <div className="flex justify-between text-gray-600">
-                        <span></span>
-                        <span className="font-mono text-gray-500">初回 / 2回目以降</span>
-                      </div>
                       {cost.breakdown.map((item, i) => (
                         <div key={i} className="flex justify-between text-gray-600">
                           <span>{item.label}</span>
-                          <span className="font-mono">{item.initial.toLocaleString()} / {item.recurring.toLocaleString()} <span className="text-gray-700">({item.formula})</span></span>
+                          <span className="font-mono">{item.sats.toLocaleString()} <span className="text-gray-700">({item.formula})</span></span>
                         </div>
                       ))}
                     </div>
-                    <div className="text-[10px] text-gray-600 mt-1">※ STASトークンは同一schemeで自動mint。転送後は自己転送でリサイクル</div>
+                    <div className="text-[10px] text-gray-600 mt-1">※ STASトークンは自動mintで再利用。発行コスト不要</div>
                   </div>
                 )
               })()}
@@ -851,7 +826,7 @@ function App({ mode }: { mode: AppMode }) {
         {phase === 'idle' && !configured && (
           <section className="text-center py-20 space-y-6">
             <div className="text-8xl">🚀</div>
-            <h2 className="text-3xl font-bold">STAS CANNON</h2>
+            <h2 className="text-3xl font-bold">STAS CANON</h2>
             <p className="text-gray-400 max-w-md mx-auto">
               {mode === 'localtest'
                 ? 'BSV STASトークンを高速で送金するシステム。秒間10万件の送金を10秒間実行し、合計100万件のトークン送金を実現します。'
@@ -878,7 +853,7 @@ function App({ mode }: { mode: AppMode }) {
       {/* Footer */}
       <footer className="border-t border-gray-800 mt-16">
         <div className="max-w-6xl mx-auto px-6 py-4 text-center text-xs text-gray-600">
-          STAS Cannon — High-Throughput BSV STAS Token Transfer System — Go + FastAPI + React
+          STAS CANON — High-Throughput BSV STAS Token Transfer System ©2025-2026 BitcoinPay, Inc.
         </div>
       </footer>
     </div>
