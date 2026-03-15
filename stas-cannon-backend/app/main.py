@@ -783,13 +783,13 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     print(f"[CHARGE] Found {len(p2pkh_utxos)} P2PKH UTXOs, {len(dstas_1sat_utxos)} recyclable DSTAS UTXOs")
 
     token_scheme = {
-        "name": "testJPYS",
+        "name": "STAS",
         "tokenId": address_hash160,
-        "symbol": "testJPYS",
+        "symbol": "STAS",
         "satoshisPerToken": 1,
         "freeze": False,
         "confiscation": False,
-        "isDivisible": True,
+        "isDivisible": False,
     }
     st.token_scheme = token_scheme
 

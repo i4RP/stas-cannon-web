@@ -94,13 +94,13 @@ function buildOutPoint(utxo) {
 }
 
 /**
- * Build a TokenScheme for testJPYS.
+ * Build a TokenScheme for STAS token.
  */
 function buildTokenScheme(params) {
   return new TokenScheme(
-    params.name || "testJPYS",
+    params.name || "STAS",
     params.tokenId,
-    params.symbol || "testJPYS",
+    params.symbol || "STAS",
     params.satoshisPerToken || 1,
     {
       freeze: params.freeze !== undefined ? params.freeze : false,

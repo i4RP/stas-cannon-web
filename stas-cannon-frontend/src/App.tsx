@@ -3,42 +3,43 @@ import { Link } from 'react-router-dom'
 import './App.css'
 
 // Cost estimation: calculate estimated sats needed for N transfers
-// Formula breakdown:
-//   - Token issuance: N tokens * (1 sat/token + ~2918 bytes * feeRate per output) + contract TX overhead
-//   - Transfer fees: N transfers * ~800 bytes * feeRate per transfer TX
-//   - Confirmation: no additional cost
+// Token: "STAS" (integer, non-divisible), reused across runs via mint
+// Initial run: issuance + transfer fees. Recurring: transfer fees only (tokens recycled)
 function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
-  totalSats: number;
-  breakdown: { label: string; sats: number; formula: string }[];
+  initialSats: number;
+  recurringSats: number;
+  breakdown: { label: string; initial: number; recurring: number; formula: string }[];
 } {
   const feeRate = mode === 'bsvmainnet' ? 0.05 : 0.02
   const batchSize = 500
   const batches = Math.ceil(count / batchSize)
 
-  // Token issuance cost: each DSTAS output ~2918 bytes locking script
+  // Token issuance/mint cost (initial only): each STAS output ~2918 bytes
   const issueBytesPerToken = 2918
-  const issueOverhead = 1000 // base TX overhead per batch
-  const issueSats = count * 1 // 1 sat per token
+  const issueOverhead = 1000
+  const issueSats = count * 1
   const issueFee = Math.ceil((count * issueBytesPerToken + batches * issueOverhead) * feeRate)
-  const contractFee = Math.ceil(batches * 300 * feeRate) // contract TX per batch
+  const contractFee = Math.ceil(batches * 300 * feeRate)
 
-  // Transfer fees: each transfer TX ~800 bytes
+  // Transfer fees (every run)
   const transferBytesPerTx = 800
   const transferFee = Math.ceil(count * transferBytesPerTx * feeRate)
 
-  // Fee split TX (for concurrent groups)
+  // Fee split TX (for concurrent groups, every run)
   const splitFee = count >= 100 ? Math.ceil(500 * feeRate) : 0
 
-  const totalSats = issueSats + issueFee + contractFee + transferFee + splitFee
+  const initialSats = issueSats + issueFee + contractFee + transferFee + splitFee
+  const recurringSats = transferFee + splitFee
 
   return {
-    totalSats,
+    initialSats,
+    recurringSats,
     breakdown: [
-      { label: 'トークン発行 (1sat x N)', sats: issueSats, formula: `${count} x 1 = ${issueSats}` },
-      { label: '発行TX手数料', sats: issueFee, formula: `${count} x ${issueBytesPerToken}B x ${feeRate} sat/B` },
-      { label: 'Contract TX手数料', sats: contractFee, formula: `${batches}batch x 300B x ${feeRate}` },
-      { label: '転送TX手数料', sats: transferFee, formula: `${count} x ${transferBytesPerTx}B x ${feeRate}` },
-      ...(splitFee > 0 ? [{ label: 'Fee分割TX', sats: splitFee, formula: `500B x ${feeRate}` }] : []),
+      { label: 'STASトークン発行/mint (1sat x N)', initial: issueSats, recurring: 0, formula: `${count} x 1` },
+      { label: '発行/mint TX手数料', initial: issueFee, recurring: 0, formula: `${count} x ${issueBytesPerToken}B x ${feeRate}` },
+      { label: 'Contract TX', initial: contractFee, recurring: 0, formula: `${batches}batch x 300B x ${feeRate}` },
+      { label: '転送TX手数料', initial: transferFee, recurring: transferFee, formula: `${count} x ${transferBytesPerTx}B x ${feeRate}` },
+      ...(splitFee > 0 ? [{ label: 'Fee分割TX', initial: splitFee, recurring: splitFee, formula: `500B x ${feeRate}` }] : []),
     ],
   }
 }
@@ -530,17 +531,26 @@ function App({ mode }: { mode: AppMode }) {
                 return (
                   <div className="text-xs bg-gray-800/30 rounded-lg px-3 py-2 space-y-1">
                     <div className="flex justify-between items-center">
-                      <span className="text-gray-400">推定必要量:</span>
-                      <span className="font-bold text-orange-400">{cost.totalSats.toLocaleString()} sats ({(cost.totalSats / 1e8).toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'})</span>
+                      <span className="text-gray-400">初回推定:</span>
+                      <span className="font-bold text-orange-400">{cost.initialSats.toLocaleString()} sats</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-gray-400">2回目以降 (トークン再利用):</span>
+                      <span className="font-bold text-green-400">{cost.recurringSats.toLocaleString()} sats</span>
                     </div>
                     <div className="border-t border-gray-700/50 pt-1 space-y-0.5">
+                      <div className="flex justify-between text-gray-600">
+                        <span></span>
+                        <span className="font-mono text-gray-500">初回 / 2回目以降</span>
+                      </div>
                       {cost.breakdown.map((item, i) => (
                         <div key={i} className="flex justify-between text-gray-600">
                           <span>{item.label}</span>
-                          <span className="font-mono">{item.sats.toLocaleString()} <span className="text-gray-700">({item.formula})</span></span>
+                          <span className="font-mono">{item.initial.toLocaleString()} / {item.recurring.toLocaleString()} <span className="text-gray-700">({item.formula})</span></span>
                         </div>
                       ))}
                     </div>
+                    <div className="text-[10px] text-gray-600 mt-1">※ STASトークンは同一schemeで自動mint。転送後は自己転送でリサイクル</div>
                   </div>
                 )
               })()}
