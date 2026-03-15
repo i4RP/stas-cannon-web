@@ -770,9 +770,9 @@ function App({ mode }: { mode: AppMode }) {
           </section>
         )}
 
-        {/* Idle State */}
+        {/* Idle State - hidden on mobile after mode selection */}
         {phase === 'idle' && !configured && (
-          <section className="text-center py-20 space-y-6">
+          <section className="hidden md:block text-center py-20 space-y-6">
             <div className="text-8xl">🚀</div>
             <h2 className="text-3xl font-bold">STAS CANNON</h2>
             <p className="text-gray-400 max-w-md mx-auto">
