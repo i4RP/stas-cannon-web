@@ -457,7 +457,7 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
             elif action == "configure":
                 raw = msg.get("total_transfers")
                 mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000}
-                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000_000}
+                mode_max = {"localtest": 1_000_000_000, "bsvtestnet": 1_000_000_000, "bsvmainnet": 1_000_000_000}
                 default_total = mode_defaults.get(mode, 1_000_000)
                 max_total = mode_max.get(mode, 1_000_000)
                 total = min(int(raw), max_total) if raw and int(raw) > 0 else default_total

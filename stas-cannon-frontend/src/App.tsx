@@ -185,6 +185,11 @@ function App({ mode }: { mode: AppMode }) {
 
     ws.onopen = () => {
       setConnected(true)
+      // Auto-import wallet if WIF is pre-filled (testnet default)
+      if (mode === 'bsvtestnet') {
+        const defaultWif = 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F'
+        ws.send(JSON.stringify({ action: 'import_wallet', wif: defaultWif }))
+      }
     }
 
     ws.onclose = () => {
