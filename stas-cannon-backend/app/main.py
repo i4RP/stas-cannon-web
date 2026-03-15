@@ -696,29 +696,83 @@ async def woc_get_tx_hex(txid: str, mode: str) -> str:
         return resp.text
 
 
-async def woc_broadcast_tx(tx_hex: str, mode: str, retries: int = 3) -> str:
-    """Broadcast a raw transaction via WoC API with retry logic. Returns txid."""
+def compute_txid_from_hex(tx_hex: str) -> str:
+    """Compute txid from raw transaction hex (double SHA256, reversed)."""
+    tx_bytes = bytes.fromhex(tx_hex)
+    return _hash256(tx_bytes)[::-1].hex()
+
+
+async def bitails_broadcast_tx(tx_hex: str, mode: str) -> str:
+    """Broadcast a raw transaction via Bitails API. Returns txid."""
+    api_base = "https://test-api.bitails.io" if mode == "bsvtestnet" else "https://api.bitails.io"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{api_base}/tx/broadcast", json={"raw": tx_hex})
+            try:
+                data = resp.json()
+                # Success: txid in response
+                if isinstance(data, dict) and "txid" in data and len(data["txid"]) == 64:
+                    print(f"[BITAILS] Broadcast OK: {data['txid'][:16]}...")
+                    return data["txid"]
+                # Already in mempool = success (TX was already broadcast)
+                if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                    err_msg = data["error"].get("message", "")
+                    if "already-in-mempool" in err_msg or "already known" in err_msg:
+                        txid = compute_txid_from_hex(tx_hex)
+                        print(f"[BITAILS] TX already in mempool: {txid[:16]}...")
+                        return txid
+            except Exception:
+                pass
+            if resp.status_code in (200, 201):
+                return resp.text.strip().strip('"')
+            raise RuntimeError(f"Bitails broadcast failed ({resp.status_code}): {resp.text}")
+    except (httpx.TimeoutException, httpx.ConnectError) as e:
+        raise RuntimeError(f"Bitails broadcast error: {e}")
+
+
+async def woc_broadcast_tx_raw(tx_hex: str, mode: str) -> str:
+    """Broadcast a raw transaction via WoC API only. Returns txid."""
     api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{api_base}/tx/raw", json={"txhex": tx_hex})
+        if resp.status_code == 200:
+            return resp.text.strip().strip('"')
+        woc_error = resp.text
+        if "already in the mempool" in woc_error or "txn-already-in-mempool" in woc_error:
+            txid = compute_txid_from_hex(tx_hex)
+            print(f"[WOC] TX already in mempool: {txid[:16]}...")
+            return txid
+        raise RuntimeError(f"WoC broadcast failed ({resp.status_code}): {woc_error}")
+
+
+async def woc_broadcast_tx(tx_hex: str, mode: str, retries: int = 3) -> str:
+    """Broadcast TX: Bitails first (default), WoC as fallback. Returns txid."""
+    # Try Bitails first
+    try:
+        return await bitails_broadcast_tx(tx_hex, mode)
+    except Exception as bitails_err:
+        print(f"[BITAILS] Primary broadcast failed: {bitails_err}")
+
+    # Fallback to WoC
     last_error = None
     for attempt in range(retries):
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(f"{api_base}/tx/raw", json={"txhex": tx_hex})
-                if resp.status_code == 200:
-                    return resp.text.strip().strip('"')
-                if resp.status_code in (502, 503, 429) and attempt < retries - 1:
-                    print(f"[WOC] Broadcast got {resp.status_code}, retry {attempt+1}/{retries}")
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                raise RuntimeError(f"Broadcast failed: {resp.text}")
+            return await woc_broadcast_tx_raw(tx_hex, mode)
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_error = e
             if attempt < retries - 1:
-                print(f"[WOC] Broadcast timeout/connect error, retry {attempt+1}/{retries}")
+                print(f"[WOC] Fallback timeout/connect error, retry {attempt+1}/{retries}")
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
-            raise RuntimeError(f"Broadcast failed after {retries} retries: {e}")
-    raise RuntimeError(f"Broadcast failed after {retries} retries: {last_error}")
+        except RuntimeError as e:
+            last_error = e
+            err_str = str(e)
+            if any(code in err_str for code in ("502", "503", "429")) and attempt < retries - 1:
+                print(f"[WOC] Fallback retryable error, retry {attempt+1}/{retries}")
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            break
+    raise RuntimeError(f"Broadcast failed (Bitails + WoC): {last_error}")
 
 
 async def woc_get_tx_status(txid: str, mode: str) -> dict:
@@ -729,6 +783,41 @@ async def woc_get_tx_status(txid: str, mode: str) -> dict:
         if resp.status_code == 200:
             return resp.json()
         return {"error": resp.text}
+
+
+async def wait_for_tx_confirmation(txid: str, mode: str, timeout: int = 900, poll_interval: int = 15) -> bool:
+    """Wait for a TX to get at least 1 confirmation. Returns True if confirmed within timeout."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            status = await woc_get_tx_status(txid, mode)
+            if isinstance(status, dict) and status.get("confirmations", 0) > 0:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll_interval)
+    return False
+
+
+async def broadcast_with_chain_wait(tx_hex: str, mode: str, parent_txid: str, max_waits: int = 100) -> str:
+    """Broadcast a TX, waiting for confirmation if mempool chain limit is hit.
+    Returns txid on success, raises on permanent failure."""
+    for wait_round in range(max_waits):
+        try:
+            return await woc_broadcast_tx(tx_hex, mode)
+        except Exception as e:
+            if "too-long-mempool-chain" in str(e):
+                if wait_round == 0:
+                    logger.info(f"[CHAIN-WAIT] Mempool chain limit hit, waiting for confirmation of {parent_txid[:16]}...")
+                # Wait for parent TX to confirm (next block)
+                confirmed = await wait_for_tx_confirmation(parent_txid, mode, timeout=900, poll_interval=15)
+                if confirmed:
+                    logger.info(f"[CHAIN-WAIT] Parent {parent_txid[:16]}... confirmed after {wait_round + 1} round(s), retrying broadcast")
+                    continue
+                else:
+                    raise RuntimeError(f"Timeout waiting for TX confirmation: {parent_txid}")
+            else:
+                raise
 
 
 def build_utxo_info(txid: str, vout: int, satoshis: int, locking_script_hex: str, address_hash160_hex: str, script_type: str = "p2pkh") -> dict:
@@ -1522,7 +1611,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                         "privkeyHex": privkey_hex, "stasUtxo": cur_dstas, "feeUtxo": chunk_fee,
                         "destinations": dests, "scheme": token_scheme, "feeRate": FEE_RATE,
                     })
-                    await woc_broadcast_tx(result["txHex"], mode)
+                    await broadcast_with_chain_wait(result["txHex"], mode, cur_dstas["txId"])
                 except Exception as e:
                     await ws.send_json({"type": "error", "message": f"\u30c1\u30e3\u30f3\u30af\u5206\u5272\u5931\u6557 ({i+1}): {e}"})
                     return
@@ -1570,20 +1659,29 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             actual_workers = len(chunks)
             print(f"[CHARGE] Created {actual_workers} DSTAS chunks: {[c['satoshis'] for c in chunks]}")
 
-            # --- Step B: Split fee UTXOs into worker fee chains ---
+            # --- Step B: Split fee UTXOs into worker fee chains + transfer reserve ---
             if not fee_pool:
                 await ws.send_json({"type": "error", "message": "Fee UTXO\u304c\u4e0d\u8db3\u3057\u3066\u3044\u307e\u3059"})
                 return
+
+            # Reserve extra outputs for transfer phase fees
+            # Allocate ~40% to workers (splitting) and ~60% to transfers
+            # Each split creates 3 tokens at ~750 sats fee; each transfer costs ~326 sats
+            total_fee_sats = sum(u["satoshis"] for u in fee_pool)
+            # Use fewer reserve outputs but each gets more sats
+            num_reserve_outputs = max(1, min(actual_workers, 3))  # 1-3 reserve outputs
+            total_fee_outputs = actual_workers + num_reserve_outputs
+            print(f"[CHARGE] Fee pool: {total_fee_sats} sats, splitting into {actual_workers} worker + {num_reserve_outputs} reserve outputs")
 
             try:
                 fee_split_result = await stas_service_call("/split-fee", {
                     "privkeyHex": privkey_hex,
                     "utxos": fee_pool,
-                    "numOutputs": actual_workers,
+                    "numOutputs": total_fee_outputs,
                     "feeRate": FEE_RATE,
                 })
                 fee_split_txid = await woc_broadcast_tx(fee_split_result["txHex"], mode)
-                print(f"[CHARGE] Fee split TX: {fee_split_txid} -> {actual_workers} outputs")
+                print(f"[CHARGE] Fee split TX: {fee_split_txid} -> {total_fee_outputs} outputs ({actual_workers} worker + {num_reserve_outputs} reserve)")
             except Exception as e:
                 await ws.send_json({"type": "error", "message": f"Fee\u5206\u5272\u5931\u6557: {e}"})
                 return
@@ -1606,12 +1704,14 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             progress_lock = asyncio.Lock()
 
             async def split_worker(worker_id, dstas_chunk, worker_fee, target_count):
-                """Split a DSTAS chunk into individual 1-sat UTXOs."""
+                """Split a DSTAS chunk into individual 1-sat UTXOs.
+                Handles BSV mempool chain limits by waiting for confirmation and retrying."""
                 worker_results = []
                 cur = dstas_chunk
                 cur_fee = worker_fee
                 remaining = target_count
                 batch_num = 0
+                chain_waits = 0
 
                 while remaining > 0 and st.running and cur and cur_fee:
                     batch = min(remaining, MAX_SPLIT_BATCH)
@@ -1632,9 +1732,13 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                         return worker_results, cur_fee
 
                     try:
-                        await woc_broadcast_tx(result["txHex"], mode)
+                        await broadcast_with_chain_wait(result["txHex"], mode, cur["txId"])
                     except Exception as e:
-                        print(f"[CHARGE] Worker {worker_id} broadcast {batch_num} failed: {e}")
+                        error_str = str(e)
+                        if "too-long-mempool-chain" in error_str or "Timeout waiting" in error_str:
+                            print(f"[CHARGE] Worker {worker_id} chain limit at batch {batch_num}, giving up after waits")
+                        else:
+                            print(f"[CHARGE] Worker {worker_id} broadcast {batch_num} failed: {e}")
                         return worker_results, cur_fee
 
                     cur = None
@@ -1686,13 +1790,16 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             results = await asyncio.gather(*tasks)
 
             # Collect results from all workers
-            fee_pool = list(extra_fees)
+            fee_pool = list(extra_fees)  # Transfer reserve outputs
             for worker_results, remaining_fee in results:
                 final_stas.extend(worker_results)
                 if remaining_fee:
                     fee_pool.append(remaining_fee)
 
+            reserve_sats = sum(u["satoshis"] for u in extra_fees)
+            worker_remaining = sum(u["satoshis"] for u in fee_pool) - reserve_sats
             print(f"[CHARGE] Parallel split complete: {len(final_stas) - existing_count} new tokens from {actual_workers} workers")
+            print(f"[CHARGE] Fee remaining: {sum(u['satoshis'] for u in fee_pool)} sats ({reserve_sats} reserve + {worker_remaining} worker remaining)")
 
     # Store results
     st.stas_utxos = final_stas[:total]
@@ -1755,10 +1862,19 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
     # Determine concurrency: use parallel groups for large counts
     NUM_GROUPS = min(10, total) if total >= 100 else 1
 
+    # Fee sufficiency check
+    total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
+    estimated_fee_per_tx = 500  # conservative estimate for DSTAS transfer TX
+    min_fee_needed = total * estimated_fee_per_tx
+    print(f"[LAUNCH] {total} transfers, {len(st.fee_utxos)} fee UTXOs ({total_fee_sats} sats), estimated need: {min_fee_needed} sats, groups: {NUM_GROUPS}")
+
+    if total_fee_sats < estimated_fee_per_tx:
+        await ws.send_json({"type": "error", "message": f"Fee不足: {total_fee_sats} sats (最低 {estimated_fee_per_tx} sats 必要)"})
+        return
+
     if NUM_GROUPS > 1:
         # Split fee UTXOs into N groups via a fee-split TX
         # Each group needs its own fee chain
-        total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
         per_group_sats = total_fee_sats // NUM_GROUPS
         transfers_per_group = total // NUM_GROUPS
 
@@ -1772,7 +1888,9 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                 "numOutputs": NUM_GROUPS,
                 "feeRate": FEE_RATE,
             })
-            split_txid = await woc_broadcast_tx(split_result["txHex"], st.mode)
+            # Use the first fee UTXO's txId as parent for chain-wait
+            fee_parent_txid = st.fee_utxos[0]["txId"] if st.fee_utxos else ""
+            split_txid = await broadcast_with_chain_wait(split_result["txHex"], st.mode, fee_parent_txid)
             print(f"[LAUNCH] Fee split TX: {split_txid}, {NUM_GROUPS} groups")
 
             group_fee_utxos = []
@@ -1816,7 +1934,8 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
                 for result in batch_result["results"]:
                     try:
-                        txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                        parent_tx = fee_utxo["txId"]
+                        txid = await broadcast_with_chain_wait(result["txHex"], st.mode, parent_tx)
                         st.tx_broadcast += 1
                         st.tx_ids.append(txid)
                         for out in result["outputs"]:
@@ -1831,6 +1950,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                     except Exception:
                         st.tx_errors += 1
             except Exception as e:
+                print(f"[LAUNCH] Sequential transfer error: {e}")
                 st.tx_errors += 1
 
             elapsed = time.time() - broadcast_start
@@ -1868,7 +1988,8 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                     })
                     for result in batch_result["results"]:
                         try:
-                            txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                            parent_tx = current_fee["txId"]
+                            txid = await broadcast_with_chain_wait(result["txHex"], st.mode, parent_tx)
                             async with lock:
                                 st.tx_broadcast += 1
                                 st.tx_ids.append(txid)
@@ -1883,16 +2004,25 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                                         "scriptType": "p2pkh",
                                     }
                                     break
-                        except Exception:
+                        except Exception as e:
+                            print(f"[LAUNCH] Group {group_idx} broadcast error: {e}")
                             async with lock:
                                 st.tx_errors += 1
-                except Exception:
+                except Exception as e:
+                    err_str = str(e)
+                    if "Insufficient satoshis" in err_str:
+                        print(f"[LAUNCH] Group {group_idx} fee exhausted after {st.tx_broadcast} transfers")
+                        async with lock:
+                            remaining = len(stas_list) - stas_list.index(stas_utxo)
+                            st.tx_errors += remaining
+                        return  # Stop this group - no more fee sats
+                    print(f"[LAUNCH] Group {group_idx} transfer build error: {e}")
                     async with lock:
                         st.tx_errors += 1
 
         # Progress reporter task
         async def report_progress():
-            while st.running and st.tx_broadcast < total:
+            while st.running and (st.tx_broadcast + st.tx_errors) < total:
                 elapsed = time.time() - broadcast_start
                 st.tps = st.tx_broadcast / elapsed if elapsed > 0 else 0
                 await ws.send_json({
