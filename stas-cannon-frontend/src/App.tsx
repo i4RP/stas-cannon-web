@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import './App.css'
 
 // Cost estimation: transfer fees only (STAS tokens are reused via mint across all runs)
-function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
+function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet' | 'jpysnet', count: number): {
   totalSats: number;
   breakdown: { label: string; sats: number; formula: string }[];
 } {
@@ -29,7 +29,7 @@ function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
 
 const API_URL = import.meta.env.VITE_API_URL || ''
 
-export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet'
+export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet' | 'jpysnet'
 
 type Phase = 'idle' | 'power_charge' | 'build' | 'broadcast' | 'confirm' | 'done'
 
@@ -122,6 +122,16 @@ const MODE_CONFIG = {
     explorerBaseUrl: 'https://test.whatsonchain.com',
     bitailsBaseUrl: 'https://test.bitails.io',
   },
+  jpysnet: {
+    label: 'JPYS Net',
+    sublabel: 'プライベートテストネット',
+    color: 'bg-purple-600',
+    textColor: 'text-purple-300',
+    borderColor: 'border-purple-600',
+    needsWallet: true,
+    explorerBaseUrl: '',
+    bitailsBaseUrl: '',
+  },
   bsvmainnet: {
     label: 'Mainnet',
     sublabel: 'メインネット',
@@ -197,6 +207,7 @@ function App({ mode }: { mode: AppMode }) {
       // Auto-import wallet with pre-configured default WIF
       const defaultWifs: Record<string, string> = {
         bsvtestnet: 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F',
+        jpysnet: 'cUoDtiDtFGc4wPE8vzNtZdQ6ebTuXBF33PyZwmi9cPxeJHoxmWEF',
         bsvmainnet: 'KyQ8GfyiRc5fXsCqa9jHsSCV1pyHqGD7Wb2xRNDKmrCYroMP4xby',
       }
       const wif = defaultWifs[mode]
@@ -545,7 +556,7 @@ function App({ mode }: { mode: AppMode }) {
                   <div className="bg-gray-800/50 rounded-lg px-4 py-3">
                     <span className="text-gray-500 text-xs block mb-1">残高</span>
                     <span className={`font-bold text-lg ${wallet.funded ? 'text-green-400' : 'text-red-400'}`}>
-                      {wallet.balanceBsv.toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}
+                      {wallet.balanceBsv.toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : mode === 'jpysnet' ? 'rBSV' : 'BSV'}
                     </span>
                     <span className="text-gray-500 text-xs ml-2">({wallet.balanceSatoshis.toLocaleString()} sat)</span>
                   </div>
@@ -588,7 +599,7 @@ function App({ mode }: { mode: AppMode }) {
                   </button>
                   {!wallet.funded && (
                     <p className="text-yellow-400 text-xs self-center">
-                      {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}を上記アドレスに送金してください
+                      {mode === 'bsvtestnet' ? 'tBSV' : mode === 'jpysnet' ? 'rBSV' : 'BSV'}を上記アドレスに送金してください
                     </p>
                   )}
                 </div>
@@ -606,13 +617,13 @@ function App({ mode }: { mode: AppMode }) {
                 合計推定時間: {getEstimatedTimes(mode, totalTransfers).total}
                 <span className="text-gray-600 ml-1">(チャージ {getEstimatedTimes(mode, totalTransfers).charge} + 送金 {getEstimatedTimes(mode, totalTransfers).launch} + 確認 {getEstimatedTimes(mode, totalTransfers).confirm})</span>
               </div>
-              {(mode === 'bsvtestnet' || mode === 'bsvmainnet') && (() => {
+              {(mode === 'bsvtestnet' || mode === 'bsvmainnet' || mode === 'jpysnet') && (() => {
                 const cost = getEstimatedCost(mode, totalTransfers)
                 return (
                   <div className="text-xs bg-gray-800/30 rounded-lg px-3 py-2 space-y-1">
                     <div className="flex justify-between items-center">
                       <span className="text-gray-400">推定必要量:</span>
-                      <span className="font-bold text-green-400">{cost.totalSats.toLocaleString()} sats ({(cost.totalSats / 1e8).toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'})</span>
+                      <span className="font-bold text-green-400">{cost.totalSats.toLocaleString()} sats ({(cost.totalSats / 1e8).toFixed(8)} {mode === 'bsvtestnet' ? 'tBSV' : mode === 'jpysnet' ? 'rBSV' : 'BSV'})</span>
                     </div>
                     <div className="border-t border-gray-700/50 pt-1 space-y-0.5">
                       {cost.breakdown.map((item, i) => (
@@ -915,29 +926,33 @@ function App({ mode }: { mode: AppMode }) {
               <div className="text-left max-w-3xl mx-auto w-full space-y-3">
                 <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">トランザクション詳細</h3>
                 <p className="text-xs text-gray-500">
-                  {formatNumber(stats.txBroadcast)} 件中 {txIds.length} 件を表示 — {mode === 'bsvmainnet' ? 'WoC / Bitails メインネット' : 'WoC / Bitails テストネット'}エクスプローラーで確認
+                  {formatNumber(stats.txBroadcast)} 件中 {txIds.length} 件を表示{mode !== 'jpysnet' ? ` — ${mode === 'bsvmainnet' ? 'WoC / Bitails メインネット' : 'WoC / Bitails テストネット'}エクスプローラーで確認` : ' — JPYS Net (プライベートネットワーク)'}
                 </p>
                 <div className="max-h-64 overflow-y-auto space-y-1 rounded-lg bg-gray-800/50 p-3">
                   {txIds.map((txid, i) => (
                     <div key={txid} className="flex items-center gap-2 text-xs font-mono group hover:bg-gray-700/50 rounded px-2 py-1">
                       <span className="text-gray-600 w-8 text-right shrink-0">#{i + 1}</span>
                       <span className="text-gray-400 truncate flex-1">{txid}</span>
-                      <a
-                        href={`${config.explorerBaseUrl}/tx/${txid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-400 hover:text-blue-300 shrink-0 hover:underline"
-                      >
-                        WoC
-                      </a>
-                      <a
-                        href={`${config.bitailsBaseUrl}/tx/${txid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-emerald-400 hover:text-emerald-300 shrink-0 hover:underline"
-                      >
-                        Bitails
-                      </a>
+                      {config.explorerBaseUrl && (
+                        <a
+                          href={`${config.explorerBaseUrl}/tx/${txid}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-400 hover:text-blue-300 shrink-0 hover:underline"
+                        >
+                          WoC
+                        </a>
+                      )}
+                      {config.bitailsBaseUrl && (
+                        <a
+                          href={`${config.bitailsBaseUrl}/tx/${txid}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-emerald-400 hover:text-emerald-300 shrink-0 hover:underline"
+                        >
+                          Bitails
+                        </a>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -963,6 +978,8 @@ function App({ mode }: { mode: AppMode }) {
                 ? 'BSV STASトークンを高速で送金するシステム。秒間10万件の送金を10秒間実行し、合計100万件のトークン送金を実現します。'
                 : mode === 'bsvtestnet'
                 ? 'BSVテストネットで実際のSTASトークンを送金します。tBSVを使用するため、実コストなしでテスト可能です。'
+                : mode === 'jpysnet'
+                ? 'JPYS Netプライベートネットワークで実際のSTASトークンを送金します。自動マイニング対応、P2Pメッシュで国際チームが参加可能です。'
                 : 'BSVメインネットで実際のSTASトークンを送金します。実BSVが必要です。'}
             </p>
             <div className="flex flex-col items-center gap-2 text-sm text-gray-600">

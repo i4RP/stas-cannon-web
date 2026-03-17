@@ -17,6 +17,12 @@ logger = logging.getLogger("stas_cannon")
 # Fixed testnet wallet WIF for background UTXO splitting (loaded from env)
 TESTNET_WIF = os.environ.get("TESTNET_WIF", "")
 
+# JPYS Net (regtest) RPC configuration
+JPYSNET_RPC_URL = os.environ.get("JPYSNET_RPC_URL", "http://127.0.0.1:19445")
+JPYSNET_RPC_USER = os.environ.get("JPYSNET_RPC_USER", "jpysnet")
+JPYSNET_RPC_PASS = os.environ.get("JPYSNET_RPC_PASS", "jpysnet2026")
+JPYSNET_DEFAULT_WIF = os.environ.get("JPYSNET_WIF", "cUoDtiDtFGc4wPE8vzNtZdQ6ebTuXBF33PyZwmi9cPxeJHoxmWEF")
+
 # Local UTXO tracking: Bitails address/unspent endpoint is too slow from EC2
 # for addresses with many UTXOs. Track known UTXOs locally instead.
 _tracked_utxos: dict[str, list[dict]] = {}  # address -> [{tx_hash, tx_pos, value}]
@@ -622,7 +628,7 @@ def _privkey_to_pubkey(privkey_bytes: bytes) -> bytes:
 
 def generate_bsv_wallet(mode: str) -> dict:
     """Generate a new BSV wallet (privkey + address) for the given mode."""
-    is_testnet = mode == "bsvtestnet"
+    is_testnet = mode in ("bsvtestnet", "jpysnet")
     pubkey_prefix = 0x6f if is_testnet else 0x00
     wif_prefix = 0xef if is_testnet else 0x80
 
@@ -685,6 +691,18 @@ async def check_bsv_balance(address: str, mode: str) -> dict:
     """Check BSV balance. Uses local UTXO tracking first, then WoC balance (fast), then Bitails as fallback."""
     import subprocess
     data = None
+
+    # JPYS Net: use RPC directly
+    if mode == "jpysnet":
+        data = await rpc_get_balance(address)
+        total_satoshis = data["confirmed"] + data.get("unconfirmed", 0)
+        return {
+            "balance_satoshis": total_satoshis,
+            "balance_bsv": total_satoshis / 1e8,
+            "confirmed": data["confirmed"],
+            "unconfirmed": data.get("unconfirmed", 0),
+            "funded": total_satoshis > 0,
+        }
 
     # Check locally tracked UTXOs first (much faster than network queries)
     tracked = get_tracked_utxos(address)
@@ -774,6 +792,14 @@ async def woc_get_utxos(address: str, mode: str) -> list[dict]:
     """Get UTXOs for an address. Uses local tracking first, then Bitails/WoC as fallback."""
     import subprocess, json as _json
 
+    # JPYS Net: use RPC directly
+    if mode == "jpysnet":
+        tracked = get_tracked_utxos(address)
+        if tracked:
+            logger.info(f"[UTXO] JPYSNET local tracking: {len(tracked)} UTXOs for {address[:10]}...")
+            return list(tracked)
+        return await rpc_get_utxos(address)
+
     # Check locally tracked UTXOs first
     tracked = get_tracked_utxos(address)
     if tracked:
@@ -819,6 +845,10 @@ async def woc_get_utxos(address: str, mode: str) -> list[dict]:
 
 async def woc_get_tx_hex(txid: str, mode: str) -> str:
     """Get raw transaction hex. Testnet uses Bitails first, mainnet uses WoC."""
+    # JPYS Net: use RPC directly
+    if mode == "jpysnet":
+        return await rpc_get_tx_hex(txid)
+
     timeout = httpx.Timeout(60.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         # For testnet, try Bitails first
@@ -887,6 +917,10 @@ async def woc_broadcast_tx_raw(tx_hex: str, mode: str) -> str:
 
 async def woc_broadcast_tx(tx_hex: str, mode: str, retries: int = 3) -> str:
     """Broadcast TX: Bitails first (default), WoC as fallback. Returns txid."""
+    # JPYS Net: use RPC directly
+    if mode == "jpysnet":
+        return await rpc_broadcast_tx(tx_hex)
+
     # Try Bitails first
     try:
         return await bitails_broadcast_tx(tx_hex, mode)
@@ -917,6 +951,10 @@ async def woc_broadcast_tx(tx_hex: str, mode: str, retries: int = 3) -> str:
 
 async def woc_get_tx_status(txid: str, mode: str) -> dict:
     """Check transaction status via WoC API."""
+    # JPYS Net: use RPC directly
+    if mode == "jpysnet":
+        return await rpc_get_tx_status(txid)
+
     api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{api_base}/tx/{txid}")
@@ -937,6 +975,103 @@ async def wait_for_tx_confirmation(txid: str, mode: str, timeout: int = 900, pol
             pass
         await asyncio.sleep(poll_interval)
     return False
+
+
+# --- JPYS Net (regtest) RPC Functions ---
+
+_jpysnet_imported_addresses: set[str] = set()  # Track imported addresses to avoid re-importing
+
+
+async def rpc_call(method: str, params: list = None) -> dict:
+    """Make a JSON-RPC call to the JPYS Net BSV node."""
+    payload = {
+        "jsonrpc": "1.0",
+        "id": "stas-cannon",
+        "method": method,
+        "params": params or [],
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            JPYSNET_RPC_URL,
+            json=payload,
+            auth=(JPYSNET_RPC_USER, JPYSNET_RPC_PASS),
+        )
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(f"RPC error: {data['error']}")
+        return data.get("result")
+
+
+async def rpc_import_address(address: str):
+    """Import an address into the JPYS Net node wallet (watch-only) for UTXO tracking."""
+    if address in _jpysnet_imported_addresses:
+        return
+    try:
+        await rpc_call("importaddress", [address, "", False])  # False = no rescan
+        _jpysnet_imported_addresses.add(address)
+        logger.info(f"[JPYSNET] Imported address: {address[:15]}...")
+    except Exception as e:
+        if "already in the address book" in str(e) or "already have" in str(e):
+            _jpysnet_imported_addresses.add(address)
+        else:
+            logger.warning(f"[JPYSNET] importaddress failed: {e}")
+
+
+async def rpc_broadcast_tx(tx_hex: str) -> str:
+    """Broadcast a raw transaction to JPYS Net. Returns txid."""
+    try:
+        txid = await rpc_call("sendrawtransaction", [tx_hex])
+        logger.info(f"[JPYSNET] Broadcast OK: {txid[:16]}...")
+        return txid
+    except Exception as e:
+        err_str = str(e)
+        if "already in the mempool" in err_str or "already known" in err_str or "txn-already-in-mempool" in err_str:
+            txid = compute_txid_from_hex(tx_hex)
+            logger.info(f"[JPYSNET] TX already in mempool: {txid[:16]}...")
+            return txid
+        raise
+
+
+async def rpc_get_utxos(address: str) -> list[dict]:
+    """Get UTXOs for an address from JPYS Net node."""
+    await rpc_import_address(address)
+    # Rescan just this address range to pick up new UTXOs
+    try:
+        utxos = await rpc_call("listunspent", [0, 9999999, [address]])
+    except Exception as e:
+        logger.warning(f"[JPYSNET] listunspent failed: {e}")
+        return []
+    return [{"tx_hash": u["txid"], "tx_pos": u["vout"], "value": int(round(u["amount"] * 1e8))} for u in (utxos or [])]
+
+
+async def rpc_get_balance(address: str) -> dict:
+    """Get balance for an address from JPYS Net node."""
+    utxos = await rpc_get_utxos(address)
+    total = sum(u["value"] for u in utxos)
+    return {"confirmed": total, "unconfirmed": 0}
+
+
+async def rpc_get_tx_hex(txid: str) -> str:
+    """Get raw transaction hex from JPYS Net node."""
+    return await rpc_call("getrawtransaction", [txid, 0])
+
+
+async def rpc_get_tx_status(txid: str) -> dict:
+    """Get transaction status from JPYS Net node."""
+    try:
+        data = await rpc_call("getrawtransaction", [txid, 1])
+        return {"confirmations": data.get("confirmations", 0)}
+    except Exception:
+        return {"confirmations": 0}
+
+
+async def rpc_generate_blocks(n: int = 1) -> list[str]:
+    """Generate blocks on JPYS Net (for explicit confirmation)."""
+    try:
+        return await rpc_call("generate", [n])
+    except Exception as e:
+        logger.warning(f"[JPYSNET] generate failed: {e}")
+        return []
 
 
 async def broadcast_with_chain_wait(tx_hex: str, mode: str, parent_txid: str, max_waits: int = 100) -> str:
@@ -1007,8 +1142,8 @@ def generate_address(mode: str = "localtest"):
     """Generate a simulated BSV address with correct network prefix."""
     raw = secrets.token_bytes(20)
     # Use proper version byte for each network
-    if mode in ("bsvtestnet",):
-        version = 0x6f  # testnet: m or n prefix
+    if mode in ("bsvtestnet", "jpysnet"):
+        version = 0x6f  # testnet/regtest: m or n prefix
     else:
         version = 0x00  # mainnet: 1 prefix
     return _base58check_encode(version, raw)
@@ -1414,6 +1549,7 @@ if os.path.isdir(STATIC_DIR):
     @app.get("/localtest")
     @app.get("/bsvtestnet")
     @app.get("/bsvmainnet")
+    @app.get("/jpysnet")
     async def serve_index():
         return FileResponse(
             os.path.join(STATIC_DIR, "index.html"),
@@ -1503,8 +1639,8 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
 
             elif action == "configure":
                 raw = msg.get("total_transfers")
-                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000}
-                mode_max = {"localtest": 1_000_000_000, "bsvtestnet": 1_000_000_000, "bsvmainnet": 1_000_000_000}
+                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000, "jpysnet": 10}
+                mode_max = {"localtest": 1_000_000_000, "bsvtestnet": 1_000_000_000, "bsvmainnet": 1_000_000_000, "jpysnet": 1_000_000_000}
                 default_total = mode_defaults.get(mode, 1_000_000)
                 max_total = mode_max.get(mode, 1_000_000)
                 total = min(int(raw), max_total) if raw and int(raw) > 0 else default_total
@@ -1517,7 +1653,7 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                 st.sender_address = st.wallet["address"] if st.wallet else generate_address(mode)
                 # For real modes, receiver = sender (self-transfer for token recycling)
                 # For localtest, generate a random receiver
-                if mode in ("bsvtestnet", "bsvmainnet") and st.wallet:
+                if mode in ("bsvtestnet", "bsvmainnet", "jpysnet") and st.wallet:
                     st.receiver_address = st.wallet["address"]
                 else:
                     st.receiver_address = generate_address(mode)
@@ -1773,7 +1909,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     total = st.total_transfers
     mode = st.mode
     wallet = st.wallet
-    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.001  # 1 sat/TX minimum for testnet
+    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.001  # 1 sat/TX minimum for testnet/jpysnet
 
     if not wallet:
         await ws.send_json({"type": "error", "message": "\u30a6\u30a9\u30ec\u30c3\u30c8\u304c\u8a2d\u5b9a\u3055\u308c\u3066\u3044\u307e\u305b\u3093"})

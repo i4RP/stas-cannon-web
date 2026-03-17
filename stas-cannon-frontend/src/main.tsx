@@ -12,6 +12,7 @@ createRoot(document.getElementById('root')!).render(
         <Route path="/" element={<ModeSelect />} />
         <Route path="/localtest" element={<App mode="localtest" />} />
         <Route path="/bsvtestnet" element={<App mode="bsvtestnet" />} />
+        <Route path="/jpysnet" element={<App mode="jpysnet" />} />
         <Route path="/bsvmainnet" element={<App mode="bsvmainnet" />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

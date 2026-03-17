@@ -29,6 +29,19 @@ const modes = [
     features: ['実トランザクション', 'tBSV使用', 'テストネットエクスプローラー対応', '最大10,000件'],
   },
   {
+    path: '/jpysnet',
+    title: 'JPYS Net',
+    subtitle: 'プライベートテストネット',
+    description: 'JPYS Net上で実際のSTASトークン送金を実行。自動マイニング対応のプライベートネットワーク。国際チームのP2P参加可能。',
+    color: 'from-purple-500 to-indigo-600',
+    borderColor: 'border-purple-600/30',
+    bgHover: 'hover:border-purple-500/50',
+    badge: 'JPYSNET',
+    badgeColor: 'bg-purple-600',
+    icon: '🌐',
+    features: ['実トランザクション', '自動マイニング', 'P2Pメッシュ対応', '最大100,000件'],
+  },
+  {
     path: '/bsvmainnet',
     title: 'BSV Mainnet',
     subtitle: 'メインネットモード',
@@ -70,7 +83,7 @@ function ModeSelect() {
         </div>
 
         {/* Mode Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           {modes.map((mode) => (
             <Link
               key={mode.path}
