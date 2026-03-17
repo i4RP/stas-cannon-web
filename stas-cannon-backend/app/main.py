@@ -642,8 +642,12 @@ async def check_bsv_balance(address: str, mode: str) -> dict:
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{api_base}/address/{address}/balance")
-        resp.raise_for_status()
-        data = resp.json()
+        if resp.status_code == 404:
+            # Address has no transaction history yet - return zero balance
+            data = {"confirmed": 0, "unconfirmed": 0}
+        else:
+            resp.raise_for_status()
+            data = resp.json()
 
     confirmed = data.get("confirmed", 0)
     unconfirmed = data.get("unconfirmed", 0)
