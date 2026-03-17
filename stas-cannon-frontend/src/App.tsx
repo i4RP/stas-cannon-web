@@ -207,7 +207,7 @@ function App({ mode }: { mode: AppMode }) {
       // Auto-import wallet with pre-configured default WIF
       const defaultWifs: Record<string, string> = {
         bsvtestnet: 'cQi4Q2u1eQzovYvupSQQrEh9Rimh6cEio9wYzkbrQNkp1adCeY6F',
-        jpysnet: 'cUoDtiDtFGc4wPE8vzNtZdQ6ebTuXBF33PyZwmi9cPxeJHoxmWEF',
+        jpysnet: 'cVTwjdCeFchwVsYmswyDMe1x4fFJT9xhWBvJbYydgUGqJLYwpp81',
         bsvmainnet: 'KyQ8GfyiRc5fXsCqa9jHsSCV1pyHqGD7Wb2xRNDKmrCYroMP4xby',
       }
       const wif = defaultWifs[mode]

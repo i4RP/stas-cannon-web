@@ -21,7 +21,7 @@ TESTNET_WIF = os.environ.get("TESTNET_WIF", "")
 JPYSNET_RPC_URL = os.environ.get("JPYSNET_RPC_URL", "http://127.0.0.1:19445")
 JPYSNET_RPC_USER = os.environ.get("JPYSNET_RPC_USER", "jpysnet")
 JPYSNET_RPC_PASS = os.environ.get("JPYSNET_RPC_PASS", "jpysnet2026")
-JPYSNET_DEFAULT_WIF = os.environ.get("JPYSNET_WIF", "cUoDtiDtFGc4wPE8vzNtZdQ6ebTuXBF33PyZwmi9cPxeJHoxmWEF")
+JPYSNET_DEFAULT_WIF = os.environ.get("JPYSNET_WIF", "cVTwjdCeFchwVsYmswyDMe1x4fFJT9xhWBvJbYydgUGqJLYwpp81")
 
 # Local UTXO tracking: Bitails address/unspent endpoint is too slow from EC2
 # for addresses with many UTXOs. Track known UTXOs locally instead.
