@@ -409,6 +409,23 @@ function App({ mode }: { mode: AppMode }) {
     wsRef.current?.send(JSON.stringify({ action: 'check_balance' }))
   }
 
+  const handleLogout = () => {
+    setWallet(null)
+    setWalletError('')
+    setConfigured(false)
+    setChargeComplete(false)
+    setLaunchComplete(false)
+    setPhase('idle')
+    setProgress(null)
+    setPhaseError('')
+    setTxIds([])
+    setStats({
+      txBuilt: 0, txBroadcast: 0, txConfirmed: 0, txErrors: 0,
+      tps: 0, buildDuration: 0, broadcastDuration: 0, totalDuration: 0,
+      senderAddress: '', receiverAddress: '',
+    })
+  }
+
   const formatNumber = (n: number) => n.toLocaleString()
   const isRunning = phase !== 'idle' && phase !== 'done'
   const canProceed = mode === 'localtest' || (wallet?.funded ?? false)
@@ -516,6 +533,13 @@ function App({ mode }: { mode: AppMode }) {
                       tBSV フォーセット &rarr;
                     </button>
                   )}
+                  <button
+                    onClick={handleLogout}
+                    disabled={isRunning}
+                    className="px-4 py-2 bg-red-900/30 border border-red-700/30 hover:bg-red-900/50 rounded-lg text-sm font-medium text-red-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    ログアウト
+                  </button>
                   {!wallet.funded && (
                     <p className="text-yellow-400 text-xs self-center">
                       {mode === 'bsvtestnet' ? 'tBSV' : 'BSV'}を上記アドレスに送金してください
