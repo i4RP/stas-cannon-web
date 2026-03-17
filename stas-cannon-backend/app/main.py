@@ -894,6 +894,367 @@ async def presplit_status():
     return pre_split_pool.to_dict()
 
 
+# --- Auto Faucet System ---
+
+FAUCET_API_URL = "https://witnessonchain.com/v1/faucet/tbsv"
+FAUCET_CHANNEL = "scrypt.io"
+
+
+async def _request_faucet(address: str) -> dict:
+    """Request tBSV from the scrypt.io faucet API (no CAPTCHA required)."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            FAUCET_API_URL,
+            json={"address": address, "channel": FAUCET_CHANNEL},
+        )
+        data = resp.json()
+        return data
+
+
+async def _build_consolidation_tx(
+    temp_wallets: list[dict],
+    target_address: str,
+    faucet_results: list[dict],
+) -> str | None:
+    """Build a raw TX to consolidate faucet funds from temp wallets to the target address.
+    Uses BIP143 sighash (required for BSV).
+    Returns the raw TX hex, or None if no funds to consolidate."""
+    inputs = []
+    total_value = 0
+    FAUCET_AMOUNT = 100_000  # known faucet amount per request
+
+    for i, wallet in enumerate(temp_wallets):
+        if wallet is None:
+            continue
+        result = faucet_results[i]
+        if result.get("code") != 0:
+            continue
+        txid = result.get("txid", "")
+        if not txid:
+            continue
+
+        # Determine output value: try parsing raw TX, fallback to known amount
+        out_value = FAUCET_AMOUNT
+        raw_hex = result.get("raw", "")
+        if raw_hex:
+            try:
+                raw_bytes = bytes.fromhex(raw_hex)
+                offset = 4  # skip version
+                vin_count = raw_bytes[offset]
+                offset += 1
+                for _ in range(vin_count):
+                    offset += 36  # txid + vout
+                    script_len = raw_bytes[offset]
+                    offset += 1 + script_len + 4  # script + sequence
+                offset += 1  # skip vout_count
+                out_value = int.from_bytes(raw_bytes[offset:offset + 8], "little")
+            except Exception:
+                out_value = FAUCET_AMOUNT
+
+        # Find the correct vout index for our address
+        vout_idx = 0
+        if raw_hex:
+            try:
+                target_h160 = _hash160(wallet["pubkey"])
+                raw_bytes = bytes.fromhex(raw_hex)
+                off = 4
+                vic = raw_bytes[off]
+                off += 1
+                for _ in range(vic):
+                    off += 36
+                    sl = raw_bytes[off]
+                    off += 1 + sl + 4
+                voc = raw_bytes[off]
+                off += 1
+                for vo_i in range(voc):
+                    val = int.from_bytes(raw_bytes[off:off + 8], "little")
+                    off += 8
+                    scr_len = raw_bytes[off]
+                    off += 1
+                    scr = raw_bytes[off:off + scr_len]
+                    off += scr_len
+                    # Check if P2PKH script matches our pubkey hash
+                    if len(scr) == 25 and scr[3:23] == target_h160:
+                        vout_idx = vo_i
+                        out_value = val
+                        break
+            except Exception:
+                vout_idx = 0
+
+        inputs.append({
+            "txid": txid,
+            "vout": vout_idx,
+            "value": out_value,
+            "privkey_bytes": wallet["privkey_bytes"],
+            "pubkey": wallet["pubkey"],
+        })
+        total_value += out_value
+
+    if not inputs:
+        return None
+
+    # Estimate fee: ~148 bytes per input + 34 bytes per output + 10 bytes overhead
+    estimated_size = len(inputs) * 148 + 34 + 10
+    fee = max(estimated_size, 200)  # minimum 200 sats fee
+    send_value = total_value - fee
+
+    if send_value <= 0:
+        return None
+
+    # Output script (P2PKH to target address)
+    target_raw = _base58check_decode(target_address)
+    target_h160 = target_raw[1:]  # strip version byte
+    script_pubkey = b"\x76\xa9\x14" + target_h160 + b"\x88\xac"
+
+    # --- BIP143 sighash precomputation ---
+    # hashPrevouts = hash256(all outpoints)
+    prevouts_data = b""
+    for inp in inputs:
+        prevouts_data += bytes.fromhex(inp["txid"])[::-1]
+        prevouts_data += inp["vout"].to_bytes(4, "little")
+    hash_prevouts = _hash256(prevouts_data)
+
+    # hashSequence = hash256(all sequences)
+    sequence_data = b""
+    for _ in inputs:
+        sequence_data += b"\xff\xff\xff\xff"
+    hash_sequence = _hash256(sequence_data)
+
+    # hashOutputs = hash256(all outputs)
+    outputs_data = b""
+    outputs_data += send_value.to_bytes(8, "little")
+    outputs_data += bytes([len(script_pubkey)]) + script_pubkey
+    hash_outputs = _hash256(outputs_data)
+
+    # Sign each input using BIP143 sighash
+    signed_tx = b""
+    signed_tx += (1).to_bytes(4, "little")  # version
+    signed_tx += bytes([len(inputs)])  # input count
+
+    for idx, inp in enumerate(inputs):
+        # BIP143 sighash preimage:
+        # 1. nVersion (4)
+        # 2. hashPrevouts (32)
+        # 3. hashSequence (32)
+        # 4. outpoint (36) - this input's txid + vout
+        # 5. scriptCode (var) - P2PKH script for this input
+        # 6. value (8) - value of UTXO being spent
+        # 7. nSequence (4)
+        # 8. hashOutputs (32)
+        # 9. nLocktime (4)
+        # 10. nHashType (4) - SIGHASH_ALL|FORKID = 0x41
+        h160 = _hash160(inp["pubkey"])
+        script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+
+        preimage = b""
+        preimage += (1).to_bytes(4, "little")  # nVersion
+        preimage += hash_prevouts  # hashPrevouts
+        preimage += hash_sequence  # hashSequence
+        preimage += bytes.fromhex(inp["txid"])[::-1]  # outpoint txid
+        preimage += inp["vout"].to_bytes(4, "little")  # outpoint vout
+        preimage += bytes([len(script_code)]) + script_code  # scriptCode
+        preimage += inp["value"].to_bytes(8, "little")  # value
+        preimage += b"\xff\xff\xff\xff"  # nSequence
+        preimage += hash_outputs  # hashOutputs
+        preimage += (0).to_bytes(4, "little")  # nLocktime
+        preimage += (0x41).to_bytes(4, "little")  # SIGHASH_ALL|FORKID
+
+        sighash = _hash256(preimage)
+
+        # Sign with ECDSA (secp256k1)
+        signature = _ecdsa_sign(sighash, inp["privkey_bytes"])
+        sig_der = signature + b"\x41"  # SIGHASH_ALL|FORKID hashtype byte
+
+        # Build scriptSig: <sig> <pubkey>
+        script_sig = bytes([len(sig_der)]) + sig_der + bytes([len(inp["pubkey"])]) + inp["pubkey"]
+
+        # Write signed input
+        signed_tx += bytes.fromhex(inp["txid"])[::-1]
+        signed_tx += inp["vout"].to_bytes(4, "little")
+        signed_tx += bytes([len(script_sig)]) + script_sig
+        signed_tx += b"\xff\xff\xff\xff"
+
+    signed_tx += b"\x01"  # output count
+    signed_tx += send_value.to_bytes(8, "little")
+    signed_tx += bytes([len(script_pubkey)]) + script_pubkey
+    signed_tx += (0).to_bytes(4, "little")  # locktime
+
+    return signed_tx.hex()
+
+
+def _ecdsa_sign(msg_hash: bytes, privkey_bytes: bytes) -> bytes:
+    """Sign a message hash with ECDSA secp256k1, return DER-encoded signature."""
+    # secp256k1 curve parameters
+    p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+    Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+    def modinv(a: int, m: int) -> int:
+        g, x, _ = _ext_gcd(a % m, m)
+        return x % m
+
+    def _ext_gcd(a: int, b: int) -> tuple:
+        if a == 0:
+            return b, 0, 1
+        g, x, y = _ext_gcd(b % a, a)
+        return g, y - (b // a) * x, x
+
+    def point_add(x1, y1, x2, y2):
+        if x1 is None:
+            return x2, y2
+        if x2 is None:
+            return x1, y1
+        if x1 == x2 and y1 == y2:
+            lam = (3 * x1 * x1) * modinv(2 * y1, p) % p
+        elif x1 == x2:
+            return None, None
+        else:
+            lam = (y2 - y1) * modinv(x2 - x1, p) % p
+        x3 = (lam * lam - x1 - x2) % p
+        y3 = (lam * (x1 - x3) - y1) % p
+        return x3, y3
+
+    def scalar_mult(k, x, y):
+        rx, ry = None, None
+        while k > 0:
+            if k & 1:
+                rx, ry = point_add(rx, ry, x, y)
+            x, y = point_add(x, y, x, y)
+            k >>= 1
+        return rx, ry
+
+    z = int.from_bytes(msg_hash, "big")
+    d = int.from_bytes(privkey_bytes, "big")
+
+    # RFC 6979 deterministic k
+    k = _rfc6979_k(msg_hash, privkey_bytes, n)
+
+    rx, _ = scalar_mult(k, Gx, Gy)
+    r = rx % n
+    s = (modinv(k, n) * (z + r * d)) % n
+
+    # Low-S normalization (BIP 62)
+    if s > n // 2:
+        s = n - s
+
+    # DER encode
+    def der_int(v: int) -> bytes:
+        b = v.to_bytes((v.bit_length() + 8) // 8, "big")
+        return b"\x02" + bytes([len(b)]) + b
+
+    rs = der_int(r) + der_int(s)
+    return b"\x30" + bytes([len(rs)]) + rs
+
+
+def _rfc6979_k(msg_hash: bytes, privkey_bytes: bytes, n: int) -> int:
+    """Deterministic k generation per RFC 6979."""
+    import hmac
+    v = b"\x01" * 32
+    k = b"\x00" * 32
+    k = hmac.new(k, v + b"\x00" + privkey_bytes + msg_hash, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    k = hmac.new(k, v + b"\x01" + privkey_bytes + msg_hash, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    while True:
+        v = hmac.new(k, v, hashlib.sha256).digest()
+        candidate = int.from_bytes(v, "big")
+        if 1 <= candidate < n:
+            return candidate
+        k = hmac.new(k, v + b"\x00", hashlib.sha256).digest()
+        v = hmac.new(k, v, hashlib.sha256).digest()
+
+
+@app.post("/api/faucet")
+async def auto_faucet(request_data: dict = None):
+    """Auto-faucet: request tBSV from scrypt.io faucet and optionally consolidate.
+
+    Body: {"address": "<target_testnet_address>", "count": 1}
+    - address: target testnet address to receive tBSV
+    - count: number of faucet requests (each generates a new temp address), default 1
+    """
+    if request_data is None:
+        request_data = {}
+    target_address = request_data.get("address", "")
+    count = min(request_data.get("count", 1), 10)  # max 10 per call
+
+    if not target_address:
+        return {"error": "address is required"}
+
+    results = []
+    temp_wallets = []
+    faucet_results = []
+
+    for i in range(count):
+        if count == 1:
+            # Single request: send directly to target address
+            data = await _request_faucet(target_address)
+            results.append({
+                "address": target_address,
+                "code": data.get("code"),
+                "message": data.get("message", ""),
+                "txid": data.get("txid", ""),
+            })
+            faucet_results.append(data)
+            temp_wallets.append(None)
+        else:
+            # Multiple requests: generate temp address, request faucet, consolidate later
+            wallet = generate_bsv_wallet("bsvtestnet")
+            temp_wallets.append(wallet)
+            data = await _request_faucet(wallet["address"])
+            faucet_results.append(data)
+            results.append({
+                "address": wallet["address"],
+                "code": data.get("code"),
+                "message": data.get("message", ""),
+                "txid": data.get("txid", ""),
+            })
+            # Small delay between requests to avoid rate limiting
+            if i < count - 1:
+                await asyncio.sleep(1)
+
+    success_count = sum(1 for r in results if r["code"] == 0)
+    total_received = success_count * 100000  # ~100,000 sats per faucet request
+
+    response = {
+        "success": success_count > 0,
+        "total_requests": count,
+        "successful": success_count,
+        "total_sats": total_received,
+        "results": results,
+    }
+
+    # If multiple requests succeeded, build consolidation TX
+    if count > 1 and success_count > 0:
+        try:
+            consolidation_hex = await _build_consolidation_tx(
+                temp_wallets, target_address, faucet_results
+            )
+            if consolidation_hex:
+                # Broadcast consolidation TX via Bitails (testnet)
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    broadcast_resp = await client.post(
+                        "https://test-api.bitails.io/tx/broadcast",
+                        json={"raw": consolidation_hex},
+                    )
+                    broadcast_data = broadcast_resp.json()
+                    txid = broadcast_data.get("txid", "")
+                    if txid:
+                        response["consolidation_txid"] = txid
+                        response["consolidated"] = True
+                    elif broadcast_resp.status_code == 200:
+                        response["consolidation_txid"] = str(broadcast_data)
+                        response["consolidated"] = True
+                    else:
+                        response["consolidation_error"] = str(broadcast_data)
+                        response["consolidated"] = False
+        except Exception as e:
+            response["consolidation_error"] = str(e)
+            response["consolidated"] = False
+
+    return response
+
+
 # Serve frontend static files
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 if os.path.isdir(STATIC_DIR):

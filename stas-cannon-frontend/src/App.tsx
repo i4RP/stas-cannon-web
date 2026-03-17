@@ -169,6 +169,8 @@ function App({ mode }: { mode: AppMode }) {
   const [walletError, setWalletError] = useState('')
   const [phaseError, setPhaseError] = useState('')
   const [showFaucetModal, setShowFaucetModal] = useState(false)
+  const [faucetLoading, setFaucetLoading] = useState(false)
+  const [faucetMessage, setFaucetMessage] = useState('')
   const [presplitStatus, setPresplitStatus] = useState<{ status: string; available: number; progress: number; total: number; error: string } | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
@@ -409,6 +411,38 @@ function App({ mode }: { mode: AppMode }) {
     wsRef.current?.send(JSON.stringify({ action: 'check_balance' }))
   }
 
+  const handleAutoFaucet = async () => {
+    if (!wallet?.address) return
+    setFaucetLoading(true)
+    setFaucetMessage('フォーセットにリクエスト中...')
+    try {
+      const baseUrl = API_URL || window.location.origin
+      const resp = await fetch(`${baseUrl}/api/faucet`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address: wallet.address, count: 1 }),
+      })
+      const data = await resp.json()
+      if (data.success) {
+        setFaucetMessage(`${data.total_sats.toLocaleString()} sats 取得成功! 残高更新中...`)
+        // Auto-refresh balance after a short delay
+        setTimeout(() => {
+          wsRef.current?.send(JSON.stringify({ action: 'check_balance' }))
+          setFaucetMessage('')
+        }, 3000)
+      } else {
+        const msg = data.results?.[0]?.message || 'フォーセット失敗'
+        setFaucetMessage(`失敗: ${msg}`)
+        setTimeout(() => setFaucetMessage(''), 5000)
+      }
+    } catch (e) {
+      setFaucetMessage(`エラー: ${e}`)
+      setTimeout(() => setFaucetMessage(''), 5000)
+    } finally {
+      setFaucetLoading(false)
+    }
+  }
+
   const handleLogout = () => {
     setWallet(null)
     setWalletError('')
@@ -526,12 +560,24 @@ function App({ mode }: { mode: AppMode }) {
                     {walletLoading ? '確認中...' : '残高更新'}
                   </button>
                   {mode === 'bsvtestnet' && (
-                    <button
-                      onClick={() => setShowFaucetModal(true)}
-                      className="px-4 py-2 bg-yellow-600/20 border border-yellow-600/30 hover:bg-yellow-600/30 rounded-lg text-sm font-medium text-yellow-400 transition-colors"
-                    >
-                      tBSV フォーセット &rarr;
-                    </button>
+                    <>
+                      <button
+                        onClick={handleAutoFaucet}
+                        disabled={faucetLoading}
+                        className="px-4 py-2 bg-green-600/20 border border-green-600/30 hover:bg-green-600/30 rounded-lg text-sm font-medium text-green-400 transition-colors disabled:opacity-50"
+                      >
+                        {faucetLoading ? '取得中...' : 'tBSV 自動取得'}
+                      </button>
+                      <button
+                        onClick={() => setShowFaucetModal(true)}
+                        className="px-4 py-2 bg-yellow-600/20 border border-yellow-600/30 hover:bg-yellow-600/30 rounded-lg text-sm font-medium text-yellow-400 transition-colors"
+                      >
+                        手動フォーセット &rarr;
+                      </button>
+                    </>
+                  )}
+                  {faucetMessage && (
+                    <p className="text-xs text-green-400 self-center">{faucetMessage}</p>
                   )}
                   <button
                     onClick={handleLogout}
