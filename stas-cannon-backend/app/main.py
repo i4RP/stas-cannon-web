@@ -17,6 +17,34 @@ logger = logging.getLogger("stas_cannon")
 # Fixed testnet wallet WIF for background UTXO splitting (loaded from env)
 TESTNET_WIF = os.environ.get("TESTNET_WIF", "")
 
+# Local UTXO tracking: Bitails address/unspent endpoint is too slow from EC2
+# for addresses with many UTXOs. Track known UTXOs locally instead.
+_tracked_utxos: dict[str, list[dict]] = {}  # address -> [{tx_hash, tx_pos, value}]
+
+def register_utxo(address: str, tx_hash: str, tx_pos: int, value: int):
+    """Register a known UTXO for local tracking."""
+    if address not in _tracked_utxos:
+        _tracked_utxos[address] = []
+    # Avoid duplicates
+    for u in _tracked_utxos[address]:
+        if u["tx_hash"] == tx_hash and u["tx_pos"] == tx_pos:
+            return
+    _tracked_utxos[address].append({"tx_hash": tx_hash, "tx_pos": tx_pos, "value": value})
+    logger.info(f"[UTXO-TRACK] Registered: {address[:10]}... {tx_hash[:16]}:{tx_pos} = {value} sats")
+
+def consume_utxo(address: str, tx_hash: str, tx_pos: int):
+    """Remove a consumed UTXO from local tracking."""
+    if address in _tracked_utxos:
+        _tracked_utxos[address] = [
+            u for u in _tracked_utxos[address]
+            if not (u["tx_hash"] == tx_hash and u["tx_pos"] == tx_pos)
+        ]
+        logger.info(f"[UTXO-TRACK] Consumed: {address[:10]}... {tx_hash[:16]}:{tx_pos}")
+
+def get_tracked_utxos(address: str) -> list[dict]:
+    """Get locally tracked UTXOs for an address."""
+    return _tracked_utxos.get(address, [])
+
 
 class PreSplitPool:
     """Global pool of pre-split 1-sat DSTAS UTXOs ready for transfer.
@@ -94,7 +122,7 @@ async def background_presplit():
         mode = "bsvtestnet"
         privkey_hex = wallet["privkey_bytes"].hex()
         address_hash160 = wallet["hash160"].hex()
-        FEE_RATE = 0.02
+        FEE_RATE = 0.001  # Minimum fee rate for testnet (1 sat per ~1000 bytes)
 
         token_scheme = {
             "name": "STAS",
@@ -208,7 +236,20 @@ async def background_presplit():
             batch_num = 0
             total_batches = (new_count + MAX_SPLIT_BATCH - 1) // MAX_SPLIT_BATCH
 
+            # Reserve at least 80% of fee sats for user operations
+            # Don't split at all if we have < 200,000 sats (not enough to be worth splitting)
+            MIN_RESERVE_SATS = max(50000, int(total_p2pkh_sats * 0.8))
+            if total_p2pkh_sats < 200000:
+                logger.info(f"[PRESPLIT] Skipping split: only {total_p2pkh_sats} sats (need >= 200,000)")
+                pool.fee_utxos = fee_pool
+                pool.status = "ready"
+                return
             while remaining > 0 and cur and fee_pool:
+                # Stop if fee pool drops below reserve threshold
+                fee_total = sum(u["satoshis"] for u in fee_pool)
+                if fee_total < MIN_RESERVE_SATS:
+                    logger.info(f"[PRESPLIT] Stopping split: fee reserve {fee_total} < {MIN_RESERVE_SATS} sats")
+                    break
                 batch = min(remaining, MAX_SPLIT_BATCH)
                 batch_num += 1
 
@@ -270,8 +311,8 @@ async def background_presplit():
             estimated_issue_fee = int(5000 * FEE_RATE) + 500
             min_required = MINT_AMOUNT + estimated_issue_fee
 
-            # If not enough P2PKH to mint even a small amount, just mark ready with nothing
-            if total_p2pkh_sats < 2000:
+            # Don't mint if balance is low (< 200,000 sats) - preserve for user operations
+            if total_p2pkh_sats < 200000:
                 pool.fee_utxos = fee_pool
                 pool.status = "ready"
                 logger.info(f"[PRESPLIT] Insufficient balance ({total_p2pkh_sats} sats) to mint, ready with {pool.available} UTXOs")
@@ -348,7 +389,14 @@ async def background_presplit():
                     remaining = source_dstas["satoshis"]
                     batch_num = 0
 
+                    # Reserve at least 50% of fee sats for user operations
+                    MINT_RESERVE_SATS = max(10000, sum(u["satoshis"] for u in fee_pool) // 2)
                     while remaining > 0 and cur and fee_pool:
+                        # Stop if fee pool drops below reserve threshold
+                        fee_total = sum(u["satoshis"] for u in fee_pool)
+                        if fee_total < MINT_RESERVE_SATS:
+                            logger.info(f"[PRESPLIT] Stopping mint-split: fee reserve {fee_total} < {MINT_RESERVE_SATS} sats")
+                            break
                         batch = min(remaining, MAX_SPLIT_BATCH)
                         batch_num += 1
 
@@ -634,20 +682,59 @@ def import_bsv_wallet(wif: str) -> dict:
 
 
 async def check_bsv_balance(address: str, mode: str) -> dict:
-    """Check BSV balance via WoC API."""
-    if mode == "bsvtestnet":
-        api_base = "https://api.whatsonchain.com/v1/bsv/test"
-    else:
-        api_base = "https://api.whatsonchain.com/v1/bsv/main"
+    """Check BSV balance. Uses local UTXO tracking first, then Bitails/WoC as fallback."""
+    import subprocess
+    data = None
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(f"{api_base}/address/{address}/balance")
-        if resp.status_code == 404:
-            # Address has no transaction history yet - return zero balance
-            data = {"confirmed": 0, "unconfirmed": 0}
-        else:
-            resp.raise_for_status()
-            data = resp.json()
+    # Check locally tracked UTXOs first (much faster than network queries)
+    tracked = get_tracked_utxos(address)
+    if tracked:
+        total = sum(u["value"] for u in tracked)
+        logger.info(f"[BALANCE] Local tracking: {len(tracked)} UTXOs, {total} sats")
+        data = {"confirmed": total, "unconfirmed": 0}
+
+    # For testnet, use Bitails via curl in thread (non-blocking)
+    if data is None and mode == "bsvtestnet":
+        def _curl_balance():
+            try:
+                r = subprocess.run(
+                    ["curl", "-4", "-s", "--connect-timeout", "10", "--max-time", "30",
+                     f"https://test-api.bitails.io/address/{address}/unspent"],
+                    capture_output=True, text=True, timeout=35,
+                )
+                return r
+            except Exception:
+                return None
+        try:
+            result = await asyncio.to_thread(_curl_balance)
+            if result and result.returncode == 0 and result.stdout.strip():
+                import json
+                body = json.loads(result.stdout)
+                utxos = body.get("unspent", body) if isinstance(body, dict) else body
+                if isinstance(utxos, list):
+                    total = sum(u.get("value", u.get("satoshis", 0)) for u in utxos)
+                    data = {"confirmed": total, "unconfirmed": 0}
+                    logger.info(f"[BALANCE] Bitails (curl): {len(utxos)} UTXOs, {total} sats")
+        except Exception as e:
+            logger.warning(f"[BALANCE] Bitails curl error: {e}")
+
+    # For mainnet (or testnet fallback), use WoC via httpx
+    if data is None:
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
+            try:
+                resp = await client.get(f"{api_base}/address/{address}/balance")
+                if resp.status_code == 404:
+                    data = {"confirmed": 0, "unconfirmed": 0}
+                else:
+                    resp.raise_for_status()
+                    data = resp.json()
+            except Exception as e:
+                logger.warning(f"[BALANCE] WoC error: {e}")
+
+    if data is None:
+        data = {"confirmed": 0, "unconfirmed": 0}
 
     confirmed = data.get("confirmed", 0)
     unconfirmed = data.get("unconfirmed", 0)
@@ -683,18 +770,66 @@ async def stas_service_call(endpoint: str, payload: dict) -> dict:
 
 
 async def woc_get_utxos(address: str, mode: str) -> list[dict]:
-    """Get UTXOs for an address via WoC API."""
-    api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(f"{api_base}/address/{address}/unspent")
-        resp.raise_for_status()
-        return resp.json()
+    """Get UTXOs for an address. Uses local tracking first, then Bitails/WoC as fallback."""
+    import subprocess, json as _json
+
+    # Check locally tracked UTXOs first
+    tracked = get_tracked_utxos(address)
+    if tracked:
+        logger.info(f"[UTXO] Local tracking: {len(tracked)} UTXOs for {address[:10]}...")
+        return list(tracked)  # Already in {tx_hash, tx_pos, value} format
+
+    # For testnet, use Bitails via curl in thread (non-blocking)
+    if mode == "bsvtestnet":
+        def _curl_utxos():
+            try:
+                r = subprocess.run(
+                    ["curl", "-4", "-s", "--connect-timeout", "10", "--max-time", "30",
+                     f"https://test-api.bitails.io/address/{address}/unspent"],
+                    capture_output=True, text=True, timeout=35,
+                )
+                return r
+            except Exception:
+                return None
+        try:
+            result = await asyncio.to_thread(_curl_utxos)
+            if result and result.returncode == 0 and result.stdout.strip():
+                body = _json.loads(result.stdout)
+                utxos = body.get("unspent", body) if isinstance(body, dict) else body
+                if isinstance(utxos, list) and len(utxos) > 0:
+                    logger.info(f"[UTXO] Bitails (curl): {len(utxos)} UTXOs")
+                    return [{"tx_hash": u.get("txid", ""), "tx_pos": u.get("vout", 0), "value": u.get("satoshis", u.get("value", 0))} for u in utxos]
+        except Exception as e:
+            logger.warning(f"[UTXO] Bitails curl error: {e}")
+    # Fallback to WoC
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
+        try:
+            resp = await client.get(f"{api_base}/address/{address}/unspent")
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"[UTXO] WoC error: {e}")
+            return []
 
 
 async def woc_get_tx_hex(txid: str, mode: str) -> str:
-    """Get raw transaction hex via WoC API."""
-    api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    """Get raw transaction hex. Testnet uses Bitails first, mainnet uses WoC."""
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # For testnet, try Bitails first
+        if mode == "bsvtestnet":
+            try:
+                resp = await client.get(f"https://test-api.bitails.io/tx/{txid}/raw")
+                if resp.status_code == 200:
+                    return resp.text
+            except Exception as e:
+                logger.warning(f"[TX_HEX] Bitails error: {e}")
+        # Fallback to WoC
+        api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
         resp = await client.get(f"{api_base}/tx/{txid}/hex")
         resp.raise_for_status()
         return resp.text
@@ -887,6 +1022,20 @@ def generate_txid():
 async def healthz():
     return {"status": "ok"}
 
+
+@app.post("/api/seed-utxo")
+async def seed_utxo(data: dict = None):
+    """Manually register a known UTXO for local tracking."""
+    if not data:
+        return {"error": "data required"}
+    address = data.get("address", "")
+    tx_hash = data.get("tx_hash", "")
+    tx_pos = data.get("tx_pos", 0)
+    value = data.get("value", 0)
+    if address and tx_hash and value > 0:
+        register_utxo(address, tx_hash, tx_pos, value)
+        return {"ok": True, "tracked": get_tracked_utxos(address)}
+    return {"error": "invalid params"}
 
 @app.get("/api/presplit-status")
 async def presplit_status():
@@ -1233,6 +1382,9 @@ async def auto_faucet(request_data: dict = None):
                     if txid:
                         response["consolidation_txid"] = txid
                         response["consolidated"] = True
+                        # Register UTXO in local tracking
+                        output_sats = total_received - 200  # estimated fee
+                        register_utxo(target_address, txid, 0, output_sats)
                     elif broadcast_resp.status_code == 200:
                         response["consolidation_txid"] = str(broadcast_data)
                         response["consolidated"] = True
@@ -1324,7 +1476,10 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                             **pre_split_pool.to_dict(),
                         })
                 except Exception as e:
-                    await websocket.send_json({"type": "wallet_error", "message": str(e)})
+                    try:
+                        await websocket.send_json({"type": "wallet_error", "message": str(e)})
+                    except RuntimeError:
+                        logger.warning(f"[WS] Could not send wallet_error (connection closed): {e}")
 
             elif action == "check_balance":
                 if not st.wallet:
@@ -1340,7 +1495,10 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                         "funded": balance["funded"],
                     })
                 except Exception as e:
-                    await websocket.send_json({"type": "wallet_error", "message": str(e)})
+                    try:
+                        await websocket.send_json({"type": "wallet_error", "message": str(e)})
+                    except RuntimeError:
+                        logger.warning(f"[WS] Could not send balance_error (connection closed): {e}")
 
             elif action == "configure":
                 raw = msg.get("total_transfers")
@@ -1614,7 +1772,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     total = st.total_transfers
     mode = st.mode
     wallet = st.wallet
-    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02
+    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.001  # 1 sat/TX minimum for testnet
 
     if not wallet:
         await ws.send_json({"type": "error", "message": "\u30a6\u30a9\u30ec\u30c3\u30c8\u304c\u8a2d\u5b9a\u3055\u308c\u3066\u3044\u307e\u305b\u3093"})
@@ -1639,7 +1797,34 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             st.receiver_address = wallet["address"]
             st.receiver_hash160 = address_hash160
             total_fee_sats = sum(u["satoshis"] for u in taken_fees)
-            logger.info(f"[CHARGE] Used pre-split pool: {total} UTXOs, {len(taken_fees)} fee UTXOs ({total_fee_sats} sats)")
+            # If pool has no fee UTXOs, fetch P2PKH UTXOs from wallet
+            if total_fee_sats < total:
+                logger.info(f"[CHARGE] Pre-split pool fee insufficient ({total_fee_sats} sats), fetching from wallet...")
+                try:
+                    raw_utxos = await woc_get_utxos(wallet["address"], mode)
+                    for candidate in sorted(raw_utxos, key=lambda u: u.get("value", 0), reverse=True):
+                        if candidate["value"] <= 1:
+                            continue  # Skip 1-sat UTXOs (likely DSTAS)
+                        try:
+                            tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+                            tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
+                            output = tx_info["outputs"][candidate["tx_pos"]]
+                            if output.get("scriptType") == "p2pkh":
+                                fee_utxo = {
+                                    "txId": candidate["tx_hash"], "vout": candidate["tx_pos"],
+                                    "satoshis": candidate["value"],
+                                    "lockingScriptHex": output["lockingScriptHex"],
+                                    "addressHash160": address_hash160, "scriptType": "p2pkh",
+                                }
+                                st.fee_utxos = [fee_utxo]
+                                total_fee_sats = candidate["value"]
+                                logger.info(f"[CHARGE] Supplemented fee from wallet: {total_fee_sats} sats")
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.warning(f"[CHARGE] Failed to supplement fee: {e}")
+            logger.info(f"[CHARGE] Used pre-split pool: {total} UTXOs, {len(st.fee_utxos)} fee UTXOs ({total_fee_sats} sats)")
             await ws.send_json({
                 "type": "phase_complete", "phase": "power_charge",
                 "utxos_prepared": total, "issue_txid": "presplit",
@@ -2209,7 +2394,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
     address_hash160 = wallet["hash160"].hex()
     token_scheme = st.token_scheme
     receiver_hash160 = st.receiver_hash160
-    FEE_RATE = 0.05 if st.mode == "bsvmainnet" else 0.02
+    FEE_RATE = 0.05 if st.mode == "bsvmainnet" else 0.001  # 1 sat/TX minimum for testnet
 
     await ws.send_json({"type": "phase", "phase": "launch", "total": total})
 
@@ -2226,7 +2411,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
     # Fee sufficiency check
     total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
-    estimated_fee_per_tx = 500  # conservative estimate for DSTAS transfer TX
+    estimated_fee_per_tx = 1 if st.mode == "bsvtestnet" else 500  # 1 sat/TX for testnet
     min_fee_needed = total * estimated_fee_per_tx
     print(f"[LAUNCH] {total} transfers, {len(st.fee_utxos)} fee UTXOs ({total_fee_sats} sats), estimated need: {min_fee_needed} sats, groups: {NUM_GROUPS}")
 

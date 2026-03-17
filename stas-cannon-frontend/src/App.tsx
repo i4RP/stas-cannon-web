@@ -7,7 +7,7 @@ function getEstimatedCost(mode: 'bsvtestnet' | 'bsvmainnet', count: number): {
   totalSats: number;
   breakdown: { label: string; sats: number; formula: string }[];
 } {
-  const feeRate = mode === 'bsvmainnet' ? 0.05 : 0.02
+  const feeRate = mode === 'bsvmainnet' ? 0.05 : 0.001  // 1 sat/TX minimum for testnet
 
   // Transfer fees (every run - tokens already exist via mint)
   const transferBytesPerTx = 800
