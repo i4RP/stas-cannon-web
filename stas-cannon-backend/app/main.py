@@ -1092,13 +1092,13 @@ async def broadcast_with_chain_wait(tx_hex: str, mode: str, parent_txid: str, ma
                     continue
                 else:
                     raise RuntimeError(f"Timeout waiting for TX confirmation: {parent_txid}")
-            elif "mempool min fee not met" in err_str:
-                # Mempool is full - wait for blocks to be mined to clear space
+            elif "mempool min fee not met" in err_str or "Missing inputs" in err_str:
+                # Mempool is full or parent TX evicted - wait for blocks to clear space
                 if wait_round == 0:
-                    logger.info(f"[CHAIN-WAIT] Mempool min fee not met, waiting for blocks to clear...")
+                    logger.info(f"[CHAIN-WAIT] Mempool issue ({err_str[:60]}), waiting for blocks to clear...")
                 await asyncio.sleep(15)  # Wait for gen=1 auto-mining to clear mempool
-                if wait_round >= 20:
-                    raise RuntimeError(f"Mempool min fee not met after {wait_round + 1} retries")
+                if wait_round >= 40:
+                    raise RuntimeError(f"Mempool issue not resolved after {wait_round + 1} retries: {err_str[:80]}")
                 continue
             else:
                 raise
@@ -2780,6 +2780,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
         async def process_group(group_idx: int, stas_list: list, fee_utxo: dict):
             """Process a single transfer group sequentially."""
             current_fee = fee_utxo
+            consecutive_errors = 0
             for stas_utxo in stas_list:
                 if not st.running:
                     return
@@ -2798,6 +2799,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                             async with lock:
                                 st.tx_broadcast += 1
                                 st.tx_ids.append(txid)
+                            consecutive_errors = 0
                             # Chain fee change for next transfer
                             for out in result["outputs"]:
                                 if out["scriptType"] == "p2pkh" and out["satoshis"] > 0:
@@ -2810,9 +2812,16 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                                     }
                                     break
                         except Exception as e:
-                            print(f"[LAUNCH] Group {group_idx} broadcast error: {e}")
+                            consecutive_errors += 1
+                            print(f"[LAUNCH] Group {group_idx} broadcast error ({consecutive_errors}): {e}")
                             async with lock:
                                 st.tx_errors += 1
+                            if consecutive_errors >= 10:
+                                print(f"[LAUNCH] Group {group_idx} stopping after {consecutive_errors} consecutive errors")
+                                async with lock:
+                                    remaining = len(stas_list) - stas_list.index(stas_utxo) - 1
+                                    st.tx_errors += remaining
+                                return
                 except Exception as e:
                     err_str = str(e)
                     if "Insufficient satoshis" in err_str:
@@ -2821,9 +2830,16 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                             remaining = len(stas_list) - stas_list.index(stas_utxo)
                             st.tx_errors += remaining
                         return  # Stop this group - no more fee sats
-                    print(f"[LAUNCH] Group {group_idx} transfer build error: {e}")
+                    consecutive_errors += 1
+                    print(f"[LAUNCH] Group {group_idx} transfer build error ({consecutive_errors}): {e}")
                     async with lock:
                         st.tx_errors += 1
+                    if consecutive_errors >= 10:
+                        print(f"[LAUNCH] Group {group_idx} stopping after {consecutive_errors} consecutive errors")
+                        async with lock:
+                            remaining = len(stas_list) - stas_list.index(stas_utxo) - 1
+                            st.tx_errors += remaining
+                        return
 
         # Progress reporter task
         async def report_progress():
