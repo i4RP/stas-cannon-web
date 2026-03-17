@@ -1167,7 +1167,10 @@ def _rfc6979_k(msg_hash: bytes, privkey_bytes: bytes, n: int) -> int:
 
 @app.post("/api/faucet")
 async def auto_faucet(request_data: dict = None):
-    """Auto-faucet: request tBSV from scrypt.io faucet and optionally consolidate.
+    """Auto-faucet: request tBSV from scrypt.io faucet using temp addresses.
+
+    Always generates a fresh temp address per request to bypass per-address cooldown,
+    then consolidates funds to the target address via a signed TX.
 
     Body: {"address": "<target_testnet_address>", "count": 1}
     - address: target testnet address to receive tBSV
@@ -1186,32 +1189,20 @@ async def auto_faucet(request_data: dict = None):
     faucet_results = []
 
     for i in range(count):
-        if count == 1:
-            # Single request: send directly to target address
-            data = await _request_faucet(target_address)
-            results.append({
-                "address": target_address,
-                "code": data.get("code"),
-                "message": data.get("message", ""),
-                "txid": data.get("txid", ""),
-            })
-            faucet_results.append(data)
-            temp_wallets.append(None)
-        else:
-            # Multiple requests: generate temp address, request faucet, consolidate later
-            wallet = generate_bsv_wallet("bsvtestnet")
-            temp_wallets.append(wallet)
-            data = await _request_faucet(wallet["address"])
-            faucet_results.append(data)
-            results.append({
-                "address": wallet["address"],
-                "code": data.get("code"),
-                "message": data.get("message", ""),
-                "txid": data.get("txid", ""),
-            })
-            # Small delay between requests to avoid rate limiting
-            if i < count - 1:
-                await asyncio.sleep(1)
+        # Always generate a fresh temp address to avoid per-address cooldown
+        wallet = generate_bsv_wallet("bsvtestnet")
+        temp_wallets.append(wallet)
+        data = await _request_faucet(wallet["address"])
+        faucet_results.append(data)
+        results.append({
+            "address": wallet["address"],
+            "code": data.get("code"),
+            "message": data.get("message", ""),
+            "txid": data.get("txid", ""),
+        })
+        # Small delay between requests to avoid rate limiting
+        if i < count - 1:
+            await asyncio.sleep(1)
 
     success_count = sum(1 for r in results if r["code"] == 0)
     total_received = success_count * 100000  # ~100,000 sats per faucet request
@@ -1224,8 +1215,8 @@ async def auto_faucet(request_data: dict = None):
         "results": results,
     }
 
-    # If multiple requests succeeded, build consolidation TX
-    if count > 1 and success_count > 0:
+    # Consolidate funds from temp addresses to target address
+    if success_count > 0:
         try:
             consolidation_hex = await _build_consolidation_tx(
                 temp_wallets, target_address, faucet_results
@@ -1248,6 +1239,9 @@ async def auto_faucet(request_data: dict = None):
                     else:
                         response["consolidation_error"] = str(broadcast_data)
                         response["consolidated"] = False
+            else:
+                response["consolidation_error"] = "Could not build consolidation TX"
+                response["consolidated"] = False
         except Exception as e:
             response["consolidation_error"] = str(e)
             response["consolidated"] = False
