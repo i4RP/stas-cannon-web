@@ -682,7 +682,7 @@ def import_bsv_wallet(wif: str) -> dict:
 
 
 async def check_bsv_balance(address: str, mode: str) -> dict:
-    """Check BSV balance. Uses local UTXO tracking first, then Bitails/WoC as fallback."""
+    """Check BSV balance. Uses local UTXO tracking first, then WoC balance (fast), then Bitails as fallback."""
     import subprocess
     data = None
 
@@ -693,14 +693,30 @@ async def check_bsv_balance(address: str, mode: str) -> dict:
         logger.info(f"[BALANCE] Local tracking: {len(tracked)} UTXOs, {total} sats")
         data = {"confirmed": total, "unconfirmed": 0}
 
-    # For testnet, use Bitails via curl in thread (non-blocking)
+    # Try WoC balance endpoint first (fast - returns just numbers, not UTXO list)
+    if data is None:
+        timeout = httpx.Timeout(15.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
+            try:
+                resp = await client.get(f"{api_base}/address/{address}/balance")
+                if resp.status_code == 404:
+                    # Address not found = no balance yet (new address)
+                    pass
+                elif resp.status_code == 200:
+                    data = resp.json()
+                    logger.info(f"[BALANCE] WoC balance: confirmed={data.get('confirmed',0)}, unconfirmed={data.get('unconfirmed',0)}")
+            except Exception as e:
+                logger.warning(f"[BALANCE] WoC error: {e}")
+
+    # For testnet, try Bitails unspent as fallback (slow for addresses with many UTXOs)
     if data is None and mode == "bsvtestnet":
         def _curl_balance():
             try:
                 r = subprocess.run(
-                    ["curl", "-4", "-s", "--connect-timeout", "10", "--max-time", "30",
+                    ["curl", "-4", "-s", "--connect-timeout", "5", "--max-time", "15",
                      f"https://test-api.bitails.io/address/{address}/unspent"],
-                    capture_output=True, text=True, timeout=35,
+                    capture_output=True, text=True, timeout=20,
                 )
                 return r
             except Exception:
@@ -717,21 +733,6 @@ async def check_bsv_balance(address: str, mode: str) -> dict:
                     logger.info(f"[BALANCE] Bitails (curl): {len(utxos)} UTXOs, {total} sats")
         except Exception as e:
             logger.warning(f"[BALANCE] Bitails curl error: {e}")
-
-    # For mainnet (or testnet fallback), use WoC via httpx
-    if data is None:
-        timeout = httpx.Timeout(30.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            api_base = "https://api.whatsonchain.com/v1/bsv/test" if mode == "bsvtestnet" else "https://api.whatsonchain.com/v1/bsv/main"
-            try:
-                resp = await client.get(f"{api_base}/address/{address}/balance")
-                if resp.status_code == 404:
-                    data = {"confirmed": 0, "unconfirmed": 0}
-                else:
-                    resp.raise_for_status()
-                    data = resp.json()
-            except Exception as e:
-                logger.warning(f"[BALANCE] WoC error: {e}")
 
     if data is None:
         data = {"confirmed": 0, "unconfirmed": 0}
@@ -2089,6 +2090,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                     dests.append({"satoshis": change_sats, "toHash160": address_hash160})
 
                 fee_utxo = fee_pool.pop(0)
+                print(f"[SPLIT-DEBUG] batch={batch_num} stasUtxo={cur} feeUtxo={fee_utxo}")
 
                 try:
                     result = await stas_service_call("/split", {
@@ -2096,6 +2098,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                         "destinations": dests, "scheme": token_scheme, "feeRate": FEE_RATE,
                     })
                 except Exception as e:
+                    print(f"[SPLIT-DEBUG] FAILED: {e}")
                     await ws.send_json({"type": "error", "message": f"\u5206\u5272\u5931\u6557 (\u30d0\u30c3\u30c1 {batch_num}): {e}"})
                     return
 
@@ -2211,14 +2214,52 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                 await ws.send_json({"type": "error", "message": "Fee UTXO\u304c\u4e0d\u8db3\u3057\u3066\u3044\u307e\u3059"})
                 return
 
-            # Reserve extra outputs for transfer phase fees
-            # Optimal allocation: ~43% to workers (splitting), ~57% to transfers
-            # Each split creates 3 tokens at ~750 sats; each transfer costs ~330 sats
-            # For equal-size outputs: reserve_count / total = 0.57 → reserve ≈ workers * 1.3
+            # Fee allocation strategy:
+            # /split-fee creates EQUAL outputs. Workers return unused fee after splits.
+            # Total fee available for transfers = reserve_outputs + worker_remaining.
+            # Key: minimize worker outputs size (just enough for splits) to maximize
+            # the leftover that flows to transfers.
+            #
+            # DSTAS split TXs are ~15KB → ~16 sats/split at 0.001 rate
+            # STAS transfer TXs observed ~7 sats/transfer
+            import math
             total_fee_sats = sum(u["satoshis"] for u in fee_pool)
-            num_reserve_outputs = max(1, round(actual_workers * 1.3))
+            splits_per_worker = math.ceil(per_worker / MAX_SPLIT_BATCH)
+            est_fee_per_split = max(16, int(15000 * FEE_RATE))
+            est_fee_per_transfer = max(7, int(7000 * FEE_RATE))  # observed ~7 sats/transfer
+
+            # Workers need just enough for their splits (with 20% margin)
+            min_per_worker_sats = int(splits_per_worker * est_fee_per_split * 1.2)
+            total_worker_need = min_per_worker_sats * actual_workers
+            # Transfers need: total * est_fee_per_transfer
+            total_transfer_need = total * est_fee_per_transfer
+
+            # Calculate optimal output count:
+            # We want worker outputs small enough for splits, and as many reserve
+            # outputs as possible to cover transfers.
+            # Since outputs are equal: sats_per_output = total / num_outputs
+            # Worker constraint: sats_per_output >= min_per_worker_sats
+            # Transfer constraint: (num_outputs - actual_workers) * sats_per_output >= total_transfer_need
+            # Max outputs we can create while satisfying worker constraint:
+            if min_per_worker_sats > 0:
+                max_total_outputs = total_fee_sats // min_per_worker_sats
+            else:
+                max_total_outputs = actual_workers + 10
+            # Reserve outputs = max_total_outputs - actual_workers
+            num_reserve_outputs = max(1, max_total_outputs - actual_workers)
+            # Cap reserve at reasonable level (transfer groups, max 10)
+            num_transfer_groups = min(10, total) if total >= 100 else 1
+            num_reserve_outputs = min(num_reserve_outputs, num_transfer_groups)
             total_fee_outputs = actual_workers + num_reserve_outputs
+            sats_per_output = total_fee_sats // total_fee_outputs if total_fee_outputs > 0 else 0
+            est_splits_possible = sats_per_output // est_fee_per_split if est_fee_per_split > 0 else 0
+            # After splits, each worker returns ~(sats_per_output - splits_per_worker * est_fee_per_split)
+            est_worker_leftover = max(0, sats_per_output - splits_per_worker * est_fee_per_split) * actual_workers
+            est_transfer_sats = num_reserve_outputs * sats_per_output + est_worker_leftover
+            est_transfers_possible = est_transfer_sats // est_fee_per_transfer if est_fee_per_transfer > 0 else 0
             print(f"[CHARGE] Fee pool: {total_fee_sats} sats, splitting into {actual_workers} worker + {num_reserve_outputs} reserve outputs")
+            print(f"[CHARGE] Each output: ~{sats_per_output} sats, est {est_splits_possible} splits/worker (need {splits_per_worker})")
+            print(f"[CHARGE] Transfer est: ~{est_transfer_sats} sats avail ({num_reserve_outputs} reserve + worker leftover), ~{est_transfers_possible} transfers possible (need {total})")
 
             try:
                 fee_split_result = await stas_service_call("/split-fee", {
@@ -2345,8 +2386,14 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
             reserve_sats = sum(u["satoshis"] for u in extra_fees)
             worker_remaining = sum(u["satoshis"] for u in fee_pool) - reserve_sats
+            total_remaining = sum(u["satoshis"] for u in fee_pool)
             print(f"[CHARGE] Parallel split complete: {len(final_stas) - existing_count} new tokens from {actual_workers} workers")
-            print(f"[CHARGE] Fee remaining: {sum(u['satoshis'] for u in fee_pool)} sats ({reserve_sats} reserve + {worker_remaining} worker remaining)")
+            print(f"[CHARGE] Fee remaining: {total_remaining} sats ({reserve_sats} reserve + {worker_remaining} worker remaining)")
+            # Budget sufficiency check for transfer phase
+            est_transfer_fee = est_fee_per_transfer  # ~7 sats per transfer
+            max_transfers = total_remaining // est_transfer_fee if est_transfer_fee > 0 else 0
+            if max_transfers < total:
+                print(f"[CHARGE] WARNING: Fee budget ({total_remaining} sats) only covers ~{max_transfers}/{total} transfers at ~{est_transfer_fee} sats/tx")
 
     # Store results
     st.stas_utxos = final_stas[:total]
@@ -2411,7 +2458,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
     # Fee sufficiency check
     total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
-    estimated_fee_per_tx = 1 if st.mode == "bsvtestnet" else 500  # 1 sat/TX for testnet
+    estimated_fee_per_tx = 7 if st.mode == "bsvtestnet" else 500  # ~7 sats/transfer for testnet DSTAS
     min_fee_needed = total * estimated_fee_per_tx
     print(f"[LAUNCH] {total} transfers, {len(st.fee_utxos)} fee UTXOs ({total_fee_sats} sats), estimated need: {min_fee_needed} sats, groups: {NUM_GROUPS}")
 
