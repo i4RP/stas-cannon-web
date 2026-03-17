@@ -1075,13 +1075,14 @@ async def rpc_generate_blocks(n: int = 1) -> list[str]:
 
 
 async def broadcast_with_chain_wait(tx_hex: str, mode: str, parent_txid: str, max_waits: int = 100) -> str:
-    """Broadcast a TX, waiting for confirmation if mempool chain limit is hit.
+    """Broadcast a TX, waiting for confirmation if mempool chain limit or min fee is hit.
     Returns txid on success, raises on permanent failure."""
     for wait_round in range(max_waits):
         try:
             return await woc_broadcast_tx(tx_hex, mode)
         except Exception as e:
-            if "too-long-mempool-chain" in str(e):
+            err_str = str(e)
+            if "too-long-mempool-chain" in err_str:
                 if wait_round == 0:
                     logger.info(f"[CHAIN-WAIT] Mempool chain limit hit, waiting for confirmation of {parent_txid[:16]}...")
                 # Wait for parent TX to confirm (next block)
@@ -1091,6 +1092,14 @@ async def broadcast_with_chain_wait(tx_hex: str, mode: str, parent_txid: str, ma
                     continue
                 else:
                     raise RuntimeError(f"Timeout waiting for TX confirmation: {parent_txid}")
+            elif "mempool min fee not met" in err_str:
+                # Mempool is full - wait for blocks to be mined to clear space
+                if wait_round == 0:
+                    logger.info(f"[CHAIN-WAIT] Mempool min fee not met, waiting for blocks to clear...")
+                await asyncio.sleep(15)  # Wait for gen=1 auto-mining to clear mempool
+                if wait_round >= 20:
+                    raise RuntimeError(f"Mempool min fee not met after {wait_round + 1} retries")
+                continue
             else:
                 raise
 
@@ -2146,14 +2155,14 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                 return
 
             try:
-                contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+                contract_txid = await broadcast_with_chain_wait(issue_result["contractTxHex"], mode, funding_txid)
                 print(f"[CHARGE] Contract TX: {contract_txid}")
             except Exception as e:
                 await ws.send_json({"type": "error", "message": f"Contract TX\u30d6\u30ed\u30fc\u30c9\u30ad\u30e3\u30b9\u30c8\u5931\u6557: {e}"})
                 return
 
             try:
-                issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
+                issue_txid = await broadcast_with_chain_wait(issue_result["issueTxHex"], mode, contract_txid)
                 st.issue_txid = issue_txid
                 print(f"[CHARGE] Issue TX: {issue_txid} ({MINT_AMOUNT:,} tokens)")
             except Exception as e:
@@ -2195,7 +2204,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
             await ws.send_json({"type": "error", "message": "Fee UTXO\u304c\u4e0d\u8db3\u3057\u3066\u3044\u307e\u3059"})
             return
 
-        NUM_WORKERS = min(10, max(1, new_count // 100))
+        NUM_WORKERS = min(5, max(1, new_count // 100))  # Cap at 5 to avoid overwhelming regtest node RPC
         if new_count < 30:
             NUM_WORKERS = 1
 
@@ -2459,11 +2468,48 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                         await broadcast_with_chain_wait(result["txHex"], mode, cur["txId"])
                     except Exception as e:
                         error_str = str(e)
-                        if "too-long-mempool-chain" in error_str or "Timeout waiting" in error_str:
+                        if "mempool min fee not met" in error_str:
+                            # Mempool is full - wait for a block to be mined, then retry
+                            print(f"[CHARGE] Worker {worker_id} mempool full at batch {batch_num}, waiting for block...")
+                            for wait_attempt in range(10):
+                                await asyncio.sleep(15)  # Wait for gen=1 to mine a block
+                                try:
+                                    await broadcast_with_chain_wait(result["txHex"], mode, cur["txId"])
+                                    print(f"[CHARGE] Worker {worker_id} retry succeeded after {wait_attempt + 1} waits")
+                                    break
+                                except Exception as retry_e:
+                                    if "mempool min fee not met" in str(retry_e):
+                                        continue
+                                    elif "Missing inputs" in str(retry_e) or "already in" in str(retry_e):
+                                        break  # TX already confirmed or inputs spent
+                                    else:
+                                        print(f"[CHARGE] Worker {worker_id} retry {wait_attempt + 1} failed: {retry_e}")
+                                        return worker_results, cur_fee
+                            else:
+                                print(f"[CHARGE] Worker {worker_id} gave up after 10 mempool waits")
+                                return worker_results, cur_fee
+                        elif "too-long-mempool-chain" in error_str or "Timeout waiting" in error_str:
                             print(f"[CHARGE] Worker {worker_id} chain limit at batch {batch_num}, giving up after waits")
+                            return worker_results, cur_fee
+                        elif "Server disconnected" in error_str or "Broken promise" in error_str:
+                            # Node temporarily overwhelmed - wait and retry
+                            print(f"[CHARGE] Worker {worker_id} node disconnected at batch {batch_num}, retrying after wait...")
+                            for retry_attempt in range(5):
+                                await asyncio.sleep(10 + retry_attempt * 5)  # Increasing backoff
+                                try:
+                                    await broadcast_with_chain_wait(result["txHex"], mode, cur["txId"])
+                                    print(f"[CHARGE] Worker {worker_id} reconnect retry succeeded after {retry_attempt + 1} attempts")
+                                    break
+                                except Exception as retry_e:
+                                    retry_str = str(retry_e)
+                                    if "Missing inputs" in retry_str or "already in" in retry_str:
+                                        break  # TX already confirmed
+                                    if retry_attempt == 4:
+                                        print(f"[CHARGE] Worker {worker_id} gave up after 5 reconnect retries: {retry_e}")
+                                        return worker_results, cur_fee
                         else:
                             print(f"[CHARGE] Worker {worker_id} broadcast {batch_num} failed: {e}")
-                        return worker_results, cur_fee
+                            return worker_results, cur_fee
 
                     cur = None
                     cur_fee = None
@@ -2594,7 +2640,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
     # Fee sufficiency check
     total_fee_sats = sum(u["satoshis"] for u in st.fee_utxos)
-    estimated_fee_per_tx = 7 if st.mode == "bsvtestnet" else 500  # ~7 sats/transfer for testnet DSTAS
+    estimated_fee_per_tx = 500 if st.mode == "bsvmainnet" else 7  # ~7 sats/transfer for testnet/jpysnet DSTAS
     min_fee_needed = total * estimated_fee_per_tx
     print(f"[LAUNCH] {total} transfers, {len(st.fee_utxos)} fee UTXOs ({total_fee_sats} sats), estimated need: {min_fee_needed} sats, groups: {NUM_GROUPS}")
 
@@ -2638,6 +2684,35 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
             print(f"[LAUNCH] Fee split failed, falling back to sequential: {e}")
             NUM_GROUPS = 1
             group_fee_utxos = []
+            # Re-fetch fee UTXOs from wallet in case originals are now invalid
+            if "Missing inputs" in str(e) or "already spent" in str(e):
+                print(f"[LAUNCH] Fee UTXOs may be stale, re-fetching from wallet...")
+                try:
+                    raw_utxos = await woc_get_utxos(wallet["address"], st.mode)
+                    fresh_fees = []
+                    for candidate in sorted(raw_utxos, key=lambda u: u.get("value", 0), reverse=True):
+                        if candidate["value"] <= 1:
+                            continue
+                        try:
+                            tx_hex = await woc_get_tx_hex(candidate["tx_hash"], st.mode)
+                            tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
+                            output = tx_info["outputs"][candidate["tx_pos"]]
+                            if output.get("scriptType") == "p2pkh":
+                                fresh_fees.append({
+                                    "txId": candidate["tx_hash"], "vout": candidate["tx_pos"],
+                                    "satoshis": candidate["value"],
+                                    "lockingScriptHex": output["lockingScriptHex"],
+                                    "addressHash160": address_hash160, "scriptType": "p2pkh",
+                                })
+                        except Exception:
+                            continue
+                    if fresh_fees:
+                        st.fee_utxos = fresh_fees
+                        print(f"[LAUNCH] Re-fetched {len(fresh_fees)} fee UTXOs ({sum(u['satoshis'] for u in fresh_fees)} sats)")
+                    else:
+                        print(f"[LAUNCH] No fresh fee UTXOs found")
+                except Exception as fetch_e:
+                    print(f"[LAUNCH] Failed to re-fetch fee UTXOs: {fetch_e}")
 
     if NUM_GROUPS <= 1:
         # Sequential mode (original behavior)
