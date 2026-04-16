@@ -13,6 +13,7 @@ createRoot(document.getElementById('root')!).render(
         <Route path="/localtest" element={<App mode="localtest" />} />
         <Route path="/bsvtestnet" element={<App mode="bsvtestnet" />} />
         <Route path="/bsvmainnet" element={<App mode="bsvmainnet" />} />
+        <Route path="/teratestnet" element={<App mode="teratestnet" />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

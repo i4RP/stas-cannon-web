@@ -9,6 +9,9 @@ import time
 import json
 import hashlib
 import httpx
+import logging
+
+logger = logging.getLogger("stas_cannon")
 
 app = FastAPI()
 
@@ -164,7 +167,7 @@ def _privkey_to_pubkey(privkey_bytes: bytes) -> bytes:
 
 def generate_bsv_wallet(mode: str) -> dict:
     """Generate a new BSV wallet (privkey + address) for the given mode."""
-    is_testnet = mode == "bsvtestnet"
+    is_testnet = mode in ("bsvtestnet", "teratestnet")
     pubkey_prefix = 0x6f if is_testnet else 0x00
     wif_prefix = 0xef if is_testnet else 0x80
 
@@ -249,6 +252,184 @@ async def check_bsv_balance(address: str, mode: str) -> dict:
     }
 
 
+# --- Teranode RPC Integration ---
+
+TERANODE_RPC_URL = os.environ.get("TERANODE_RPC_URL", "http://13.113.175.17:9292")
+TERANODE_RPC_USER = os.environ.get("TERANODE_RPC_USER", "stascannon")
+TERANODE_RPC_PASS = os.environ.get("TERANODE_RPC_PASS", "stascannon2026")
+
+
+async def teranode_rpc_call(method: str, params: list) -> dict:
+    """Call Teranode JSON-RPC API (port 9292)."""
+    payload = {
+        "jsonrpc": "1.0",
+        "id": "stascannon",
+        "method": method,
+        "params": params,
+    }
+    auth = httpx.BasicAuth(TERANODE_RPC_USER, TERANODE_RPC_PASS)
+    async with httpx.AsyncClient(timeout=30.0, auth=auth) as client:
+        resp = await client.post(
+            TERANODE_RPC_URL,
+            json=payload,
+            headers={"Content-Type": "text/plain"},
+        )
+        if resp.status_code == 401:
+            raise RuntimeError("Teranode RPC authentication failed")
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(f"Teranode RPC error: {data['error']}")
+        return data
+
+
+async def teranode_get_utxos(address: str) -> list[dict]:
+    """Get UTXOs for an address via Teranode RPC.
+
+    Teranode doesn't have a direct 'listunspent by address' RPC like WoC.
+    We use the STAS service to query UTXOs, or fall back to scanning
+    known txids. For now, we use a combination approach.
+    """
+    # Try using the Teranode's getaddressutxos if available
+    try:
+        result = await teranode_rpc_call("getaddressutxos", [{"addresses": [address]}])
+        utxos = result.get("result", [])
+        return [
+            {
+                "tx_hash": u["txid"],
+                "tx_pos": u["outputIndex"],
+                "value": u["satoshis"],
+            }
+            for u in utxos
+        ]
+    except Exception:
+        pass
+
+    # Fallback: use listunspent (requires wallet import)
+    try:
+        result = await teranode_rpc_call("listunspent", [0, 9999999, [address]])
+        utxos = result.get("result", [])
+        return [
+            {
+                "tx_hash": u["txid"],
+                "tx_pos": u["vout"],
+                "value": int(u["amount"] * 1e8) if isinstance(u["amount"], float) else u["amount"],
+            }
+            for u in utxos
+        ]
+    except Exception:
+        pass
+
+    return []
+
+
+async def teranode_get_tx_hex(txid: str) -> str:
+    """Get raw transaction hex via Teranode RPC."""
+    result = await teranode_rpc_call("getrawtransaction", [txid, 0])
+    return result["result"]
+
+
+async def teranode_broadcast_tx(tx_hex: str) -> str:
+    """Broadcast a raw transaction via Teranode RPC. Returns txid."""
+    result = await teranode_rpc_call("sendrawtransaction", [tx_hex])
+    txid = result["result"]
+    if not txid:
+        raise RuntimeError("Teranode broadcast returned empty txid")
+    return txid
+
+
+async def teranode_get_tx_status(txid: str) -> dict:
+    """Check transaction status via Teranode RPC."""
+    try:
+        result = await teranode_rpc_call("getrawtransaction", [txid, 1])
+        return result.get("result", {})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def teranode_get_balance(address: str) -> dict:
+    """Get balance for an address via Teranode RPC."""
+    try:
+        result = await teranode_rpc_call("getaddressbalance", [{"addresses": [address]}])
+        data = result.get("result", {})
+        balance = data.get("balance", 0)
+        return {
+            "balance_satoshis": balance,
+            "balance_bsv": balance / 1e8,
+            "confirmed": balance,
+            "unconfirmed": 0,
+            "funded": balance > 0,
+        }
+    except Exception:
+        # Fallback: scan UTXOs to compute balance
+        try:
+            utxos = await teranode_get_utxos(address)
+            total = sum(u["value"] for u in utxos)
+            return {
+                "balance_satoshis": total,
+                "balance_bsv": total / 1e8,
+                "confirmed": total,
+                "unconfirmed": 0,
+                "funded": total > 0,
+            }
+        except Exception:
+            return {
+                "balance_satoshis": 0,
+                "balance_bsv": 0.0,
+                "confirmed": 0,
+                "unconfirmed": 0,
+                "funded": False,
+            }
+
+
+async def teranode_get_info() -> dict:
+    """Get Teranode node info for health check."""
+    result = await teranode_rpc_call("getinfo", [])
+    return result.get("result", {})
+
+
+# --- Unified RPC dispatch ---
+
+
+def is_teratestnet(mode: str) -> bool:
+    """Check if mode is teratestnet."""
+    return mode == "teratestnet"
+
+
+async def get_utxos(address: str, mode: str) -> list[dict]:
+    """Get UTXOs - dispatches to Teranode RPC or WoC API based on mode."""
+    if is_teratestnet(mode):
+        return await teranode_get_utxos(address)
+    return await woc_get_utxos(address, mode)
+
+
+async def get_tx_hex(txid: str, mode: str) -> str:
+    """Get raw TX hex - dispatches to Teranode RPC or WoC API based on mode."""
+    if is_teratestnet(mode):
+        return await teranode_get_tx_hex(txid)
+    return await woc_get_tx_hex(txid, mode)
+
+
+async def broadcast_tx(tx_hex: str, mode: str) -> str:
+    """Broadcast TX - dispatches to Teranode RPC or WoC API based on mode."""
+    if is_teratestnet(mode):
+        return await teranode_broadcast_tx(tx_hex)
+    return await woc_broadcast_tx(tx_hex, mode)
+
+
+async def get_tx_status(txid: str, mode: str) -> dict:
+    """Get TX status - dispatches to Teranode RPC or WoC API based on mode."""
+    if is_teratestnet(mode):
+        return await teranode_get_tx_status(txid)
+    return await woc_get_tx_status(txid, mode)
+
+
+async def get_balance(address: str, mode: str) -> dict:
+    """Get balance - dispatches to Teranode RPC or WoC API based on mode."""
+    if is_teratestnet(mode):
+        return await teranode_get_balance(address)
+    return await check_bsv_balance(address, mode)
+
+
 # --- STAS Service Integration ---
 
 STAS_SERVICE_URL = os.environ.get("STAS_SERVICE_URL", "http://localhost:3001")
@@ -256,8 +437,6 @@ STAS_SERVICE_URL = os.environ.get("STAS_SERVICE_URL", "http://localhost:3001")
 
 async def stas_service_call(endpoint: str, payload: dict) -> dict:
     """Call the Node.js STAS service."""
-    import logging
-    logger = logging.getLogger("stas_service")
     logger.info(f"STAS call: POST {endpoint}")
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(f"{STAS_SERVICE_URL}{endpoint}", json=payload)
@@ -383,6 +562,7 @@ if os.path.isdir(STATIC_DIR):
     @app.get("/localtest")
     @app.get("/bsvtestnet")
     @app.get("/bsvmainnet")
+    @app.get("/teratestnet")
     async def serve_index():
         return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
@@ -405,7 +585,7 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                 try:
                     wallet_data = generate_bsv_wallet(mode)
                     st.wallet = wallet_data
-                    balance = await check_bsv_balance(wallet_data["address"], mode)
+                    balance = await get_balance(wallet_data["address"], mode)
                     await websocket.send_json({
                         "type": "wallet_created",
                         "address": wallet_data["address"],
@@ -428,7 +608,7 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                 try:
                     wallet_data = import_bsv_wallet(wif)
                     st.wallet = wallet_data
-                    balance = await check_bsv_balance(wallet_data["address"], mode)
+                    balance = await get_balance(wallet_data["address"], mode)
                     await websocket.send_json({
                         "type": "wallet_created",
                         "address": wallet_data["address"],
@@ -444,7 +624,7 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
                     await websocket.send_json({"type": "wallet_error", "message": "ウォレットが設定されていません"})
                     continue
                 try:
-                    balance = await check_bsv_balance(st.wallet["address"], mode)
+                    balance = await get_balance(st.wallet["address"], mode)
                     await websocket.send_json({
                         "type": "wallet_balance",
                         "address": st.wallet["address"],
@@ -457,8 +637,8 @@ async def websocket_cannon(websocket: WebSocket, mode: str = Query(default="loca
 
             elif action == "configure":
                 raw = msg.get("total_transfers")
-                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000}
-                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000_000}
+                mode_defaults = {"localtest": 1_000_000, "bsvtestnet": 10, "bsvmainnet": 1_000_000, "teratestnet": 100}
+                mode_max = {"localtest": 1_000_000, "bsvtestnet": 10_000, "bsvmainnet": 1_000_000, "teratestnet": 1_000_000}
                 default_total = mode_defaults.get(mode, 1_000_000)
                 max_total = mode_max.get(mode, 1_000_000)
                 total = min(int(raw), max_total) if raw and int(raw) > 0 else default_total
@@ -717,11 +897,11 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     3. Lower fee rate: 0.05 sat/byte instead of 0.1 (BSV accepts this)
     4. Self-transfer: Send to own wallet so tokens can be reused next time
     """
-    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02  # mainnet: safe rate, testnet: aggressive
-
     st.phase = "power_charge"
     total = st.total_transfers
     mode = st.mode
+
+    FEE_RATE = 0.05 if mode == "bsvmainnet" else 0.02  # mainnet: safe rate, testnet: aggressive
     wallet = st.wallet
 
     if not wallet:
@@ -736,7 +916,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
     # Step 1: Get wallet UTXOs
     try:
-        raw_utxos = await woc_get_utxos(wallet["address"], mode)
+        raw_utxos = await get_utxos(wallet["address"], mode)
     except Exception as e:
         await ws.send_json({"type": "error", "message": f"UTXO取得失敗: {e}"})
         return
@@ -753,7 +933,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
     for idx, candidate in enumerate(sorted_utxos):
         try:
             await ws.send_json({"type": "progress", "phase": "power_charge", "current": 0, "total": total, "percent": 1, "status": f"UTXO検証中... ({idx+1}/{len(sorted_utxos)})"})
-            tx_hex = await woc_get_tx_hex(candidate["tx_hash"], mode)
+            tx_hex = await get_tx_hex(candidate["tx_hash"], mode)
             tx_info = await stas_service_call("/parse-tx", {"txHex": tx_hex})
             output = tx_info["outputs"][candidate["tx_pos"]]
             if output.get("scriptType") == "p2pkh":
@@ -852,7 +1032,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
                     "utxos": consolidate_inputs,
                     "feeRate": FEE_RATE,
                 })
-                consolidate_txid = await woc_broadcast_tx(consolidate_result["txHex"], mode)
+                consolidate_txid = await broadcast_tx(consolidate_result["txHex"], mode)
                 print(f"[CHARGE] Consolidation TX broadcast: {consolidate_txid}")
                 consolidated_output = consolidate_result["outputs"][0]
                 funding_txid = consolidate_result["txId"]
@@ -918,7 +1098,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
             # Broadcast Contract TX
             try:
-                contract_txid = await woc_broadcast_tx(issue_result["contractTxHex"], mode)
+                contract_txid = await broadcast_tx(issue_result["contractTxHex"], mode)
                 print(f"[CHARGE] Batch {batch_num} Contract TX: {contract_txid}")
             except Exception as e:
                 await ws.send_json({"type": "error", "message": f"Contract TXブロードキャスト失敗 (バッチ {batch_num}): {e}"})
@@ -926,7 +1106,7 @@ async def run_real_power_charge(ws: WebSocket, st: CannonState):
 
             # Broadcast Issue TX
             try:
-                issue_txid = await woc_broadcast_tx(issue_result["issueTxHex"], mode)
+                issue_txid = await broadcast_tx(issue_result["issueTxHex"], mode)
                 st.issue_txid = issue_txid
                 print(f"[CHARGE] Batch {batch_num} Issue TX: {issue_txid}")
             except Exception as e:
@@ -1046,7 +1226,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                 "numOutputs": NUM_GROUPS,
                 "feeRate": FEE_RATE,
             })
-            split_txid = await woc_broadcast_tx(split_result["txHex"], st.mode)
+            split_txid = await broadcast_tx(split_result["txHex"], st.mode)
             print(f"[LAUNCH] Fee split TX: {split_txid}, {NUM_GROUPS} groups")
 
             group_fee_utxos = []
@@ -1090,7 +1270,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
 
                 for result in batch_result["results"]:
                     try:
-                        txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                        txid = await broadcast_tx(result["txHex"], st.mode)
                         st.tx_broadcast += 1
                         st.tx_ids.append(txid)
                         for out in result["outputs"]:
@@ -1142,7 +1322,7 @@ async def run_real_launch(ws: WebSocket, st: CannonState):
                     })
                     for result in batch_result["results"]:
                         try:
-                            txid = await woc_broadcast_tx(result["txHex"], st.mode)
+                            txid = await broadcast_tx(result["txHex"], st.mode)
                             async with lock:
                                 st.tx_broadcast += 1
                                 st.tx_ids.append(txid)
@@ -1224,7 +1404,7 @@ async def run_real_confirm(ws: WebSocket, st: CannonState):
         nonlocal confirmed, checked
         async with semaphore:
             try:
-                tx_status = await woc_get_tx_status(txid, st.mode)
+                tx_status = await get_tx_status(txid, st.mode)
                 if "error" not in tx_status:
                     async with lock:
                         confirmed += 1

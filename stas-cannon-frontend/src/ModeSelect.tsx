@@ -41,6 +41,19 @@ const modes = [
     icon: '🔴',
     features: ['実トランザクション', '実BSV使用', 'メインネットエクスプローラー対応', '最大1,000件'],
   },
+  {
+    path: '/teratestnet',
+    title: 'Teranode Teratestnet',
+    subtitle: 'Teranodeテストネットモード',
+    description: 'BSV Teranode Teratestnet上でSTASトークン送金を実行。1M+ TPS対応の次世代ノード。tBSVを使用。',
+    color: 'from-cyan-500 to-teal-600',
+    borderColor: 'border-cyan-600/30',
+    bgHover: 'hover:border-cyan-500/50',
+    badge: 'TERATESTNET',
+    badgeColor: 'bg-cyan-600',
+    icon: '⚡',
+    features: ['実トランザクション', 'tBSV使用', 'Teranode RPC (1M+ TPS)', '最大1,000,000件'],
+  },
 ]
 
 function ModeSelect() {
@@ -70,7 +83,7 @@ function ModeSelect() {
         </div>
 
         {/* Mode Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           {modes.map((mode) => (
             <Link
               key={mode.path}
