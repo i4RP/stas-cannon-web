@@ -4,7 +4,7 @@ import './App.css'
 
 const API_URL = import.meta.env.VITE_API_URL || ''
 
-export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet'
+export type AppMode = 'localtest' | 'bsvtestnet' | 'bsvmainnet' | 'teratestnet'
 
 type Phase = 'idle' | 'power_charge' | 'build' | 'broadcast' | 'confirm' | 'done'
 
@@ -103,6 +103,17 @@ const MODE_CONFIG = {
     needsWallet: true,
     explorerBaseUrl: 'https://whatsonchain.com',
     bitailsBaseUrl: 'https://bitails.io',
+  },
+  teratestnet: {
+    label: 'Teratestnet',
+    sublabel: 'Teranodeテストネット',
+    color: 'bg-cyan-600',
+    textColor: 'text-cyan-300',
+    borderColor: 'border-cyan-600',
+    transferOptions: [100, 1000, 10000, 100000, 1000000],
+    needsWallet: true,
+    explorerBaseUrl: 'https://test.whatsonchain.com',
+    bitailsBaseUrl: 'https://test.bitails.io',
   },
 }
 
